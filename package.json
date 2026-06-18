@@ -1,6 +1,6 @@
 {
   "name": "pi-secured-setup",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Security extension for pi-agent: boundary enforcement, secret detection, skill verification, and audit logging",
   "keywords": [
     "pi-package"

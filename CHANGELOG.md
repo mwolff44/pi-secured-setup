@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-18
+
+### Fixed
+- Patched non-bundled transitive dependencies reachable via `@earendil-works/pi-ai` → `@google/genai` using npm `overrides`
+- Bumped `protobufjs` to `7.6.4` and `ws` to `8.21.0` in the non-bundled dependency tree
+
+### Security
+- Mitigated Dependabot advisories for `protobufjs` (GHSA-wcpc-wj8m-hjx6, GHSA-f38q-mgvj-vph7, GHSA-jggg-4jg4-v7c6) and `ws` (GHSA-96hv-2xvq-fx4p, GHSA-58qx-3vcg-4xpx) where reachable
+- Bundled copies inside `@earendil-works/pi-coding-agent@0.79.6` (`undici`, `protobufjs`, `ws`) remain and require an upstream bump from the `@earendil-works` publisher
+
 ## [1.0.1] - 2026-06-18
 
 ### Fixed
