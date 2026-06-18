@@ -6,7 +6,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, mkdirSync } from "node:fs";
+import { existsSync, rmSync, mkdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { initAuditLog, auditLog, _setAuditFileForTest } from "../lib/audit.js";
@@ -61,5 +61,11 @@ describe("audit log rotation cleans up overflow files", () => {
 		auditLog("test.permissions", "info", { check: true });
 		const testAuditFile = resolve(tempDir, "audit.jsonl");
 		assert.ok(existsSync(testAuditFile), "audit file should exist");
+
+		// Skip POSIX mode check on Windows (mode bits are not reliable)
+		if (process.platform !== "win32") {
+			const mode = statSync(testAuditFile).mode & 0o777;
+			assert.equal(mode, 0o600, `expected 0o600 permissions, got 0${mode.toString(8)}`);
+		}
 	});
 });

@@ -73,11 +73,16 @@ export function migrateNameBasedKeys(db: SkillApprovalsDb, cwd: string): SkillAp
 	let changed = false;
 
 	for (const skill of skills) {
-		// If there's an entry keyed by name but not by path, migrate it
+		// If there's an entry keyed by name, migrate or clean it up
 		const nameEntry = migrated[skill.name];
 		const pathEntry = migrated[skill.skillMdPath];
 		if (nameEntry && !pathEntry) {
-			migrated[skill.skillMdPath] = nameEntry;
+			// Migrate name-key to path-key, fixing the path field
+			migrated[skill.skillMdPath] = { ...nameEntry, path: skill.skillMdPath };
+			delete migrated[skill.name];
+			changed = true;
+		} else if (nameEntry && pathEntry) {
+			// Path-based key already exists — remove stale name-based key
 			delete migrated[skill.name];
 			changed = true;
 		}
@@ -359,7 +364,8 @@ export function trustSkill(skillName: string): { ok: boolean; message: string } 
 	}
 
 	const currentHash = "sha256:" + sha256(content);
-	const db = loadApprovals();
+	let db = loadApprovals();
+	db = migrateNameBasedKeys(db, process.cwd());
 
 	db.skills[skill.skillMdPath] = {
 		path: skill.skillMdPath,
