@@ -129,6 +129,10 @@ export interface Redaction {
 	original: string;
 }
 
+export interface RedactOptions {
+	skipCommentLines?: boolean;
+}
+
 /**
  * Regex that matches an entire PEM private key block, from BEGIN to END.
  * Captures the full block including body and END line.
@@ -188,7 +192,9 @@ function redactLineContent(line: string): { result: string; redactions: Redactio
  * have secrets redacted normally.
  * Returns the redacted string and a list of redactions performed.
  */
-export function redactString(value: string): { result: string; redactions: Redaction[] } {
+export function redactString(value: string, options: RedactOptions = {}): { result: string; redactions: Redaction[] } {
+	const skipComments = options.skipCommentLines !== false;
+
 	// Step 1: Redact multi-line PEM blocks before line-by-line processing
 	const { result: pemRedacted, redactions: pemRedactions } = redactPEMBlocks(value);
 	const allRedactions: Redaction[] = [...pemRedactions];
@@ -198,7 +204,7 @@ export function redactString(value: string): { result: string; redactions: Redac
 	const resultLines: string[] = [];
 
 	for (const line of lines) {
-		if (isCommentLine(line)) {
+		if (skipComments && isCommentLine(line)) {
 			resultLines.push(line);
 		} else {
 			const { result, redactions } = redactLineContent(line);

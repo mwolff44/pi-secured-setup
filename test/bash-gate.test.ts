@@ -125,6 +125,22 @@ describe("splitCommand", () => {
 		assert.ok(parts.some((p: string) => p === "echo $(hostname)"));
 		assert.ok(parts.some((p: string) => p === "hostname"));
 	});
+
+	it("handles quoted parens inside $(...)", () => {
+		const parts = splitCommand("echo $(printf ')')");
+		assert.ok(
+			parts.some((p: string) => p.includes("printf")),
+			`Inner subshell should contain 'printf', got: ${JSON.stringify(parts)}`,
+		);
+	});
+
+	it("handles double-quoted parens inside $(...)", () => {
+		const parts = splitCommand('echo $(foo "(")');
+		assert.ok(
+			parts.some((p: string) => p.includes("foo")),
+			`Inner subshell should contain 'foo', got: ${JSON.stringify(parts)}`,
+		);
+	});
 });
 
 describe("classifySegment", () => {

@@ -168,7 +168,7 @@ export function registerGuardPipeline(
 			const command = input.command as string | undefined;
 			if (!command) return undefined;
 
-			const safeCommand = redactString(command).result;
+			const safeCommand = redactString(command, { skipCommentLines: false }).result;
 			const bashVerdict = guards.classifyCommand(command, config);
 
 			// Auto-approve safe and moderate

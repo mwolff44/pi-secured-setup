@@ -188,6 +188,20 @@ describe("redactString", () => {
 		assert.equal(redactions.length, 0, "should not redact fake PEM block");
 		assert.equal(result, fake);
 	});
+
+	it("redacts secrets on comment lines when skipCommentLines is false", () => {
+		const input = "# password=MyS3cret123";
+		const { result, redactions } = redactString(input, { skipCommentLines: false });
+		assert.ok(redactions.length > 0, "should redact secret on comment line when skipCommentLines is false");
+		assert.ok(result.includes("***REDACTED:password***"));
+	});
+
+	it("skips comment lines by default for backward compatibility", () => {
+		const input = "# password=MyS3cret123";
+		const { result, redactions } = redactString(input);
+		assert.equal(redactions.length, 0, "should skip comment line by default");
+		assert.equal(result, input);
+	});
 });
 
 describe("walkAndRedact", () => {

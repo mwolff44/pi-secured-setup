@@ -94,9 +94,40 @@ export function splitCommand(command: string): string[] {
 			current += command[i] + command[i + 1];
 			i += 2;
 			while (i < command.length && depth > 0) {
-				if (command[i] === "(") depth++;
-				if (command[i] === ")") depth--;
-				current += command[i];
+				const innerCh = command[i];
+
+				// TODO: Quote-handling logic is duplicated from the top-level loop.
+				// If more nesting types are added, extract into a shared helper.
+				if (innerCh === "'") {
+					current += innerCh;
+					i++;
+					while (i < command.length && command[i] !== "'") {
+						current += command[i];
+						i++;
+					}
+					if (i < command.length) { current += command[i]; i++; }
+					continue;
+				}
+
+				if (innerCh === '"') {
+					current += innerCh;
+					i++;
+					while (i < command.length && command[i] !== '"') {
+						if (command[i] === "\\" && i + 1 < command.length) {
+							current += command[i] + command[i + 1];
+							i += 2;
+						} else {
+							current += command[i];
+							i++;
+						}
+					}
+					if (i < command.length) { current += command[i]; i++; }
+					continue;
+				}
+
+				if (innerCh === "(") depth++;
+				if (innerCh === ")") depth--;
+				current += innerCh;
 				i++;
 			}
 			// Extract inner command for separate classification
