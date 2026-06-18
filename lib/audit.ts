@@ -112,15 +112,6 @@ function maybeRotate(): void {
 		const src = `${AUDIT_FILE}.${i}`;
 		const dest = `${AUDIT_FILE}.${i + 1}`;
 		if (existsSync(src)) {
-			if (i + 1 > config.maxFiles) {
-				// Delete oldest file that would exceed maxFiles
-				try {
-					unlinkSync(src);
-				} catch {
-					// File may have already been removed
-				}
-				continue;
-			}
 			renameSync(src, dest);
 		}
 	}

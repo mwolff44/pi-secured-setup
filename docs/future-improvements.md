@@ -42,7 +42,7 @@ pi.on("project_trust", async (event, ctx) => {
   const skills = discoverAllSkills(event.cwd);
   const unapproved = skills.filter(s => !isApproved(s));
   if (unapproved.length > 0) {
-    auditLog("project_trust_denied", "warn", { unapprovedSkills: unapproved.map(s => s.name) });
+    auditLog("project_trust_denied", "warning", { unapprovedSkills: unapproved.map(s => s.name) });
     return { trusted: "no" as const };
   }
   return { trusted: "yes" as const };

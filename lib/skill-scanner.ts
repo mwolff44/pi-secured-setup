@@ -37,7 +37,7 @@ interface SkillApproval {
 	status: "approved" | "denied" | "skipped";
 }
 
-interface SkillApprovalsDb {
+export interface SkillApprovalsDb {
 	version: number;
 	skills: Record<string, SkillApproval>;
 }

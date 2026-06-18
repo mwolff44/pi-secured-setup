@@ -33,7 +33,7 @@ describe("migrateNameBasedKeys", () => {
 		assert.equal(Object.keys(result.skills).length, 1);
 	});
 
-	it("migrates name-based keys to path-based keys when skill is discoverable", () => {
+	it("preserves name-based keys when skill directory is not discoverable", () => {
 		// Simulate an old DB keyed by skill name
 		const nameKey = "my-skill";
 		const pathKey = "/home/user/.pi/agent/skills/my-skill/SKILL.md";

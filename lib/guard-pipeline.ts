@@ -100,8 +100,8 @@ export function registerGuardPipeline(
 					boundary: config.cwd,
 					reason: "blocked (no UI for confirmation)",
 				});
-				return { block: true, reason: boundaryVerdict.reason };
-			}
+			return { block: true, reason: boundaryVerdict.message };
+		}
 
 			const approved = await ctx.ui.confirm("🔒 Boundary Check", boundaryVerdict.message);
 			if (!approved) {
@@ -145,7 +145,7 @@ export function registerGuardPipeline(
 					path: input.path ?? "",
 					reason: "blocked (no UI for confirmation)",
 				});
-				return { block: true, reason: protectedVerdict.reason };
+				return { block: true, reason: protectedVerdict.message };
 			}
 
 			const approved = await ctx.ui.confirm("🔒 Protected Path", protectedVerdict.message);
