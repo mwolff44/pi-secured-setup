@@ -185,12 +185,14 @@ export function registerGuardPipeline(
 			// Confirm dangerous, external, and unknown commands
 			if (bashVerdict.action === "confirm") {
 				if (!ctx.hasUI) {
-					auditLog("bash.unknown.block", "warning", {
+					const category = bashVerdict.category ?? "unknown";
+					auditLog(`bash.${category}.block`, "warning", {
 						tool: "bash",
 						command: safeCommand,
+						category,
 						reason: "blocked (no UI for confirmation)",
 					});
-					return { block: true, reason: "Unknown command blocked (no UI)" };
+					return { block: true, reason: `${category.charAt(0).toUpperCase() + category.slice(1)} command blocked (no UI)` };
 				}
 
 				const approved = await ctx.ui.confirm("🔒 Bash Command", bashVerdict.message);

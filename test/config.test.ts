@@ -55,4 +55,12 @@ describe("mergePatterns", () => {
 		const result = mergePatterns([["*.pem"], ["!*.PEM"]]);
 		assert.deepEqual(result, [], "case-insensitive exclusion should remove *.pem");
 	});
+
+	it("exclusion removes all inherited duplicates of a pattern", () => {
+		const result = mergePatterns([
+			["a", "a"],
+			["!a"],
+		]);
+		assert.deepEqual(result, [], "exclusion should remove all inherited copies");
+	});
 });

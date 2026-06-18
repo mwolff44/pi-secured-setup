@@ -104,11 +104,13 @@ export function mergePatterns(layers: (string[] | undefined)[]): string[] {
 			}
 		}
 
-		// Remove any previously-added patterns that match an exclusion
+		// Remove all previously-added patterns that match an exclusion
 		for (const exc of exclusions) {
-			const idx = base.findIndex((p) => p.toLowerCase() === exc.toLowerCase());
-			if (idx !== -1) {
-				base.splice(idx, 1);
+			const excLower = exc.toLowerCase();
+			for (let i = base.length - 1; i >= 0; i--) {
+				if (base[i].toLowerCase() === excLower) {
+					base.splice(i, 1);
+				}
 			}
 		}
 

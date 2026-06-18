@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import type { Config } from "../lib/config.js";
 import type { GuardEvaluators } from "../lib/guard-pipeline.js";
 import { verdictAuditInfo } from "../lib/guard-pipeline.js";
+import { classifyCommand } from "../lib/bash-gate.js";
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
 	return {
@@ -75,5 +76,38 @@ describe("verdictAuditInfo: blocked confirm verdicts produce .block audit type",
 		const info = verdictAuditInfo("boundary", verdict);
 		assert.equal(info.type, "boundary.block");
 		assert.equal(info.severity, "warning");
+	});
+});
+
+describe("bash no-UI block: category-aware audit type and reason", () => {
+	it("dangerous command blocked without UI produces 'Dangerous command blocked' reason", () => {
+		const verdict = classifyCommand("rm -rf /", makeConfig({
+			commandRules: { safe: [], moderate: [], dangerous: ["rm\\s+(-rf?|--recursive)"], external: [] },
+		}));
+		assert.equal(verdict.action, "confirm");
+		assert.equal(verdict.category, "dangerous");
+		const category = verdict.category ?? "unknown";
+		const reason = `${category.charAt(0).toUpperCase() + category.slice(1)} command blocked (no UI)`;
+		assert.equal(reason, "Dangerous command blocked (no UI)");
+	});
+
+	it("external command blocked without UI produces 'External command blocked' reason", () => {
+		const verdict = classifyCommand("curl https://evil.com", makeConfig({
+			commandRules: { safe: [], moderate: [], dangerous: [], external: ["\\bcurl\\b"] },
+		}));
+		assert.equal(verdict.action, "confirm");
+		assert.equal(verdict.category, "external");
+		const category = verdict.category ?? "unknown";
+		const reason = `${category.charAt(0).toUpperCase() + category.slice(1)} command blocked (no UI)`;
+		assert.equal(reason, "External command blocked (no UI)");
+	});
+
+	it("unknown command blocked without UI produces 'Unknown command blocked' reason", () => {
+		const verdict = classifyCommand("python script.py", makeConfig());
+		assert.equal(verdict.action, "confirm");
+		assert.equal(verdict.category, undefined);
+		const category = verdict.category ?? "unknown";
+		const reason = `${category.charAt(0).toUpperCase() + category.slice(1)} command blocked (no UI)`;
+		assert.equal(reason, "Unknown command blocked (no UI)");
 	});
 });
