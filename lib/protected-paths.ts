@@ -23,6 +23,14 @@ import type { GuardVerdict } from "./boundary.js";
  * Patterns are matched against the relative path from cwd and the basename.
  */
 export function matchGlob(pattern: string, filePath: string): boolean {
+	// Guard against adversarial patterns
+	if (pattern.length > 256) return false;
+	if ((pattern.match(/\*\*/g) ?? []).length > 8) return false;
+
+	// Count single-star wildcards (not globstar **) to prevent ReDoS
+	const singleStars = pattern.replace(/\*\*/g, "").match(/\*/g);
+	if (singleStars && singleStars.length > 16) return false;
+
 	// Convert glob to regex
 	const regexStr = pattern
 		.replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape regex specials (except * and ?)
@@ -47,11 +55,13 @@ export function evaluateProtectedPaths(
 	input: Record<string, unknown>,
 	config: Config,
 ): GuardVerdict {
+	const normalisedTool = toolName.toLowerCase();
+
 	// Not applicable to bash
-	if (toolName === "bash") return { action: "allow" };
+	if (normalisedTool === "bash") return { action: "allow" };
 
 	// Only applies to path-based tools
-	if (toolName !== "read" && toolName !== "write" && toolName !== "edit") {
+	if (normalisedTool !== "read" && normalisedTool !== "write" && normalisedTool !== "edit") {
 		return { action: "allow" };
 	}
 
@@ -79,7 +89,7 @@ export function evaluateProtectedPaths(
 	if (!matched) return { action: "allow" };
 
 	// Protected path matched — apply action based on tool type
-	if (toolName === "write" || toolName === "edit") {
+	if (normalisedTool === "write" || normalisedTool === "edit") {
 		return {
 			action: "block",
 			reason: `write to protected path: ${targetPath}`,

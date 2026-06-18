@@ -17,11 +17,12 @@ import { evaluateBoundary } from "./boundary.js";
 import { evaluateProtectedPaths } from "./protected-paths.js";
 import { classifyCommand } from "./bash-gate.js";
 import { auditLog, type AuditSeverity } from "./audit.js";
+import { redactString } from "./secret-scanner.js";
 
 /**
  * The audit event type prefix and severity for each verdict.
  */
-function verdictAuditInfo(
+export function verdictAuditInfo(
 	guard: string,
 	verdict: GuardVerdict & { category?: string },
 ): { type: string; severity: AuditSeverity } {
@@ -69,7 +70,7 @@ export function registerGuardPipeline(
 ): void {
 	pi.on("tool_call", async (event, ctx) => {
 		const config = getConfig();
-		const toolName = event.toolName;
+		const toolName = (event.toolName as string).toLowerCase();
 		const input = event.input as Record<string, unknown>;
 
 		// ── Step 1: Boundary ────────────────────────────────────────
@@ -92,14 +93,13 @@ export function registerGuardPipeline(
 
 		if (boundaryVerdict.action === "confirm") {
 			if (!ctx.hasUI) {
-				const { type, severity } = verdictAuditInfo("boundary", boundaryVerdict);
-				auditLog(type, "warning", {
+				auditLog("boundary.block", "warning", {
 					tool: toolName,
 					path: input.path ?? "",
 					boundary: config.cwd,
 					reason: "blocked (no UI for confirmation)",
 				});
-				return { block: true, reason: boundaryVerdict.reason };
+				return { block: true, reason: boundaryVerdict.message };
 			}
 
 			const approved = await ctx.ui.confirm("🔒 Boundary Check", boundaryVerdict.message);
@@ -144,7 +144,7 @@ export function registerGuardPipeline(
 					path: input.path ?? "",
 					reason: "blocked (no UI for confirmation)",
 				});
-				return { block: true, reason: protectedVerdict.reason };
+				return { block: true, reason: protectedVerdict.message };
 			}
 
 			const approved = await ctx.ui.confirm("🔒 Protected Path", protectedVerdict.message);
@@ -168,6 +168,7 @@ export function registerGuardPipeline(
 			const command = input.command as string | undefined;
 			if (!command) return undefined;
 
+			const safeCommand = redactString(command, { skipCommentLines: false }).result;
 			const bashVerdict = guards.classifyCommand(command, config);
 
 			// Auto-approve safe and moderate
@@ -175,7 +176,7 @@ export function registerGuardPipeline(
 				const { type, severity } = verdictAuditInfo("bash", bashVerdict);
 				auditLog(type, severity, {
 					tool: "bash",
-					command,
+					command: safeCommand,
 					category: bashVerdict.category ?? "unknown",
 				});
 				return undefined; // pass through
@@ -184,12 +185,14 @@ export function registerGuardPipeline(
 			// Confirm dangerous, external, and unknown commands
 			if (bashVerdict.action === "confirm") {
 				if (!ctx.hasUI) {
-					auditLog("bash.unknown.block", "warning", {
+					const category = bashVerdict.category ?? "unknown";
+					auditLog(`bash.${category}.block`, "warning", {
 						tool: "bash",
-						command,
+						command: safeCommand,
+						category,
 						reason: "blocked (no UI for confirmation)",
 					});
-					return { block: true, reason: "Unknown command blocked (no UI)" };
+					return { block: true, reason: `${category.charAt(0).toUpperCase() + category.slice(1)} command blocked (no UI)` };
 				}
 
 				const approved = await ctx.ui.confirm("🔒 Bash Command", bashVerdict.message);
@@ -198,7 +201,7 @@ export function registerGuardPipeline(
 				if (!approved) {
 					auditLog(`bash.${category}.block`, "warning", {
 						tool: "bash",
-						command,
+						command: safeCommand,
 						category,
 						reason: "user denied",
 					});
@@ -207,7 +210,7 @@ export function registerGuardPipeline(
 
 				auditLog(`bash.${category}.confirm`, "info", {
 					tool: "bash",
-					command,
+					command: safeCommand,
 					category,
 				});
 			}

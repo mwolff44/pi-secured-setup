@@ -49,6 +49,28 @@ describe("matchGlob", () => {
 	it("matches basename when full path doesn't match", () => {
 		assert.equal(matchGlob("*.key", "server.key"), true);
 	});
+
+	it("rejects patterns longer than 256 characters", () => {
+		const longPattern = "a".repeat(257);
+		assert.equal(matchGlob(longPattern, "anything"), false);
+	});
+
+	it("rejects patterns with more than 8 globstar segments", () => {
+		const pattern = "**/**/**/**/**/**/**/**/**/*.env";
+		assert.equal(matchGlob(pattern, "/deep/nested/path/.env"), false);
+	});
+
+	it("rejects patterns with too many single-star wildcards (ReDoS protection)", () => {
+		const pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*.txt";
+		assert.equal(matchGlob(pattern, "some/path.txt"), false);
+	});
+
+	it("does not hang on adversarial glob patterns", () => {
+		const start = Date.now();
+		matchGlob("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*.txt", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 500, `adversarial pattern took ${elapsed}ms, should be < 500ms`);
+	});
 });
 
 describe("evaluateProtectedPaths", () => {
@@ -134,5 +156,17 @@ describe("evaluateProtectedPaths", () => {
 		const config = makeConfig();
 		const result = evaluateProtectedPaths("read", {}, config);
 		assert.equal(result.action, "allow");
+	});
+
+	it("handles uppercase tool name 'Read' same as 'read'", () => {
+		const config = makeConfig();
+		const result = evaluateProtectedPaths("Read", { path: ".env" }, config);
+		assert.equal(result.action, "confirm");
+	});
+
+	it("handles uppercase tool name 'WRITE' same as 'write'", () => {
+		const config = makeConfig();
+		const result = evaluateProtectedPaths("WRITE", { path: ".env" }, config);
+		assert.equal(result.action, "block");
 	});
 });

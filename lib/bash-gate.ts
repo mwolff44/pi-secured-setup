@@ -40,23 +40,164 @@ export function classifySegment(command: string, rules: Record<CommandCategory, 
 }
 
 /**
- * Split a command string by pipes into individual segments.
- * Also extracts subshell commands from $(...) expressions.
+ * Split a command string by shell operators into individual segments.
+ * Handles quoting (single, double), subshells ($(...)), and backticks.
+ * Splits on |, ;, &&, || (in that precedence order for || vs |).
  */
 export function splitCommand(command: string): string[] {
 	const segments: string[] = [];
+	let current = "";
+	let i = 0;
 
-	// Split by pipes (simple approach — doesn't handle quoted pipes)
-	const pipeParts = command.split("|").map((s) => s.trim());
-	for (const part of pipeParts) {
-		segments.push(part);
+	while (i < command.length) {
+		const ch = command[i];
 
-		// Extract subshell commands from $(...)
-		const subshellRegex = /\$\(([^)]+)\)/g;
-		let match: RegExpExecArray | null;
-		while ((match = subshellRegex.exec(part)) !== null) {
-			segments.push(match[1].trim());
+		// Handle single-quoted strings
+		if (ch === "'") {
+			current += ch;
+			i++;
+			while (i < command.length && command[i] !== "'") {
+				current += command[i];
+				i++;
+			}
+			if (i < command.length) {
+				current += command[i];
+				i++;
+			}
+			continue;
 		}
+
+		// Handle double-quoted strings
+		if (ch === '"') {
+			current += ch;
+			i++;
+			while (i < command.length && command[i] !== '"') {
+				if (command[i] === "\\" && i + 1 < command.length) {
+					current += command[i] + command[i + 1];
+					i += 2;
+				} else {
+					current += command[i];
+					i++;
+				}
+			}
+			if (i < command.length) {
+				current += command[i];
+				i++;
+			}
+			continue;
+		}
+
+		// Handle $(...) subshells
+		if (ch === "$" && i + 1 < command.length && command[i + 1] === "(") {
+			const start = i;
+			let depth = 1;
+			current += command[i] + command[i + 1];
+			i += 2;
+			while (i < command.length && depth > 0) {
+				const innerCh = command[i];
+
+				// TODO: Quote-handling logic is duplicated from the top-level loop.
+				// If more nesting types are added, extract into a shared helper.
+				if (innerCh === "'") {
+					current += innerCh;
+					i++;
+					while (i < command.length && command[i] !== "'") {
+						current += command[i];
+						i++;
+					}
+					if (i < command.length) { current += command[i]; i++; }
+					continue;
+				}
+
+				if (innerCh === '"') {
+					current += innerCh;
+					i++;
+					while (i < command.length && command[i] !== '"') {
+						if (command[i] === "\\" && i + 1 < command.length) {
+							current += command[i] + command[i + 1];
+							i += 2;
+						} else {
+							current += command[i];
+							i++;
+						}
+					}
+					if (i < command.length) { current += command[i]; i++; }
+					continue;
+				}
+
+				if (innerCh === "(") depth++;
+				if (innerCh === ")") depth--;
+				current += innerCh;
+				i++;
+			}
+			// Extract inner command for separate classification
+			const innerStart = start + 2;
+			const innerEnd = i - 1;
+			if (innerEnd > innerStart) {
+				segments.push(command.slice(innerStart, innerEnd).trim());
+			}
+			continue;
+		}
+
+		// Handle backtick subshells
+		if (ch === "`") {
+			const start = i;
+			current += ch;
+			i++;
+			while (i < command.length && command[i] !== "`") {
+				current += command[i];
+				i++;
+			}
+			if (i < command.length) {
+				current += command[i];
+				i++;
+			}
+			// Extract inner command
+			const inner = command.slice(start + 1, i - 1).trim();
+			if (inner) {
+				segments.push(inner);
+			}
+			continue;
+		}
+
+		// Handle || (must check before |)
+		if (ch === "|" && i + 1 < command.length && command[i + 1] === "|") {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			i += 2;
+			continue;
+		}
+
+		// Handle &&
+		if (ch === "&" && i + 1 < command.length && command[i + 1] === "&") {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			i += 2;
+			continue;
+		}
+
+		// Handle | (pipe)
+		if (ch === "|") {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			i++;
+			continue;
+		}
+
+		// Handle ;
+		if (ch === ";") {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			i++;
+			continue;
+		}
+
+		current += ch;
+		i++;
+	}
+
+	if (current.trim()) {
+		segments.push(current.trim());
 	}
 
 	return segments;

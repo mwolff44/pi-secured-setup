@@ -8,6 +8,7 @@ import {
 	isCommentLine,
 	redactString,
 	walkAndRedact,
+	type Redaction,
 } from "../lib/secret-scanner.js";
 
 describe("isPlaceholder", () => {
@@ -106,10 +107,41 @@ describe("redactString", () => {
 		assert.ok(result.includes("***REDACTED:password***"));
 	});
 
-	it("skips comment lines entirely", () => {
+	it("redacts unquoted passwords", () => {
+		const { result, redactions } = redactString("password=MyS3cret123");
+		assert.ok(redactions.length > 0, "should redact unquoted password");
+		assert.ok(result.includes("***REDACTED:password***"));
+	});
+
+	it("skips single-line comment strings", () => {
 		const { result, redactions } = redactString("# password=\"supersecret123\"");
 		assert.equal(redactions.length, 0);
 		assert.equal(result, "# password=\"supersecret123\"");
+	});
+
+	it("redacts secrets on non-comment lines in multi-line strings", () => {
+		const input = "# .env example\nAPI_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+		const { result, redactions } = redactString(input);
+		assert.ok(redactions.length > 0, "should redact secret on second line");
+		assert.ok(result.includes("***REDACTED:anthropic-key***"), "secret should be redacted");
+		assert.ok(result.startsWith("# .env example\n"), "comment line should be preserved");
+	});
+
+	it("skips only comment lines in multi-line strings", () => {
+		const input = "# comment\npassword=\"supersecret123\"\n# another comment";
+		const { result, redactions } = redactString(input);
+		assert.ok(redactions.length > 0, "should redact secret on non-comment line");
+		assert.ok(result.includes("***REDACTED:password***"), "password should be redacted");
+		assert.ok(result.includes("# comment"), "comment line preserved");
+		assert.ok(result.includes("# another comment"), "another comment preserved");
+	});
+
+	it("redacts all secrets in multi-line strings with no comments", () => {
+		const input = "aws=AKIAIOSFODNN7EXAMPLE\ndb=postgres://user:pass@host/db";
+		const { result, redactions } = redactString(input);
+		assert.ok(redactions.length >= 2, "should redact both secrets");
+		assert.ok(result.includes("***REDACTED:aws-access-key***"));
+		assert.ok(result.includes("***REDACTED:db-connection***"));
 	});
 
 	it("does not redact normal strings", () => {
@@ -132,6 +164,44 @@ describe("redactString", () => {
 		assert.ok(result.startsWith("The key is "));
 		assert.ok(result.includes("in production"));
 	});
+
+	it("redacts entire multi-line PEM private key block", () => {
+		const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/y7\n-----END RSA PRIVATE KEY-----";
+		const { result, redactions } = redactString(pem);
+		assert.ok(redactions.length > 0, "should redact PEM key block");
+		assert.ok(result.includes("***REDACTED:private-key***"), "result should contain redaction marker");
+		assert.ok(!result.includes("MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn"), "PEM body should be redacted");
+		assert.ok(!result.includes("END RSA PRIVATE KEY"), "END line should be redacted");
+	});
+
+	it("redacts EC private key block", () => {
+		const pem = "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEEIJSJ\n-----END EC PRIVATE KEY-----";
+		const { result, redactions } = redactString(pem);
+		assert.ok(redactions.length > 0, "should redact EC key block");
+		assert.ok(result.includes("***REDACTED:private-key***"));
+		assert.ok(!result.includes("MHQCAQEEIJSJ"), "EC key body should be redacted");
+	});
+
+	it("does not redact fake PEM block", () => {
+		const fake = "-----BEGIN FAKE KEY-----\nsome data\n-----END FAKE KEY-----";
+		const { result, redactions } = redactString(fake);
+		assert.equal(redactions.length, 0, "should not redact fake PEM block");
+		assert.equal(result, fake);
+	});
+
+	it("redacts secrets on comment lines when skipCommentLines is false", () => {
+		const input = "# password=MyS3cret123";
+		const { result, redactions } = redactString(input, { skipCommentLines: false });
+		assert.ok(redactions.length > 0, "should redact secret on comment line when skipCommentLines is false");
+		assert.ok(result.includes("***REDACTED:password***"));
+	});
+
+	it("skips comment lines by default for backward compatibility", () => {
+		const input = "# password=MyS3cret123";
+		const { result, redactions } = redactString(input);
+		assert.equal(redactions.length, 0, "should skip comment line by default");
+		assert.equal(result, input);
+	});
 });
 
 describe("walkAndRedact", () => {
@@ -141,7 +211,7 @@ describe("walkAndRedact", () => {
 				{ role: "user", content: "Here is my key: AKIAIOSFODNN7EXAMPLE" },
 			],
 		};
-		const redactions: unknown[] = [];
+		const redactions: Redaction[] = [];
 		walkAndRedact(payload, redactions);
 		assert.ok(redactions.length > 0);
 		assert.ok(
@@ -151,7 +221,7 @@ describe("walkAndRedact", () => {
 
 	it("redacts secrets in arrays", () => {
 		const arr = ["normal", "AKIAIOSFODNN7EXAMPLE", "also normal"];
-		const redactions: unknown[] = [];
+		const redactions: Redaction[] = [];
 		walkAndRedact(arr, redactions);
 		assert.equal(redactions.length, 1);
 		assert.ok(arr[1].includes("***REDACTED:aws-access-key***"));
@@ -159,7 +229,7 @@ describe("walkAndRedact", () => {
 
 	it("handles non-string primitives", () => {
 		const obj = { num: 42, bool: true, nil: null };
-		const redactions: unknown[] = [];
+		const redactions: Redaction[] = [];
 		walkAndRedact(obj, redactions);
 		assert.equal(redactions.length, 0);
 		assert.equal(obj.num, 42);
@@ -169,7 +239,7 @@ describe("walkAndRedact", () => {
 
 	it("respects depth limit", () => {
 		const deep = { a: { b: { c: { d: { e: "AKIAIOSFODNN7EXAMPLE" } } } } };
-		const redactions: unknown[] = [];
+		const redactions: Redaction[] = [];
 		walkAndRedact(deep, redactions, 0);
 		// Should still work — depth 5 is well within limit of 50
 		assert.ok(redactions.length > 0);

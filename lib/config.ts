@@ -104,11 +104,13 @@ export function mergePatterns(layers: (string[] | undefined)[]): string[] {
 			}
 		}
 
-		// Remove any previously-added patterns that match an exclusion
+		// Remove all previously-added patterns that match an exclusion
 		for (const exc of exclusions) {
-			const idx = base.indexOf(exc);
-			if (idx !== -1) {
-				base.splice(idx, 1);
+			const excLower = exc.toLowerCase();
+			for (let i = base.length - 1; i >= 0; i--) {
+				if (base[i].toLowerCase() === excLower) {
+					base.splice(i, 1);
+				}
 			}
 		}
 
@@ -215,13 +217,25 @@ export function loadConfig(cwd: string): Config {
 		readJsonFile<AuditConfig>(resolve(DEFAULTS_DIR, "audit-config.json")) ??
 		{ maxFileSize: 10 * 1024 * 1024, maxFiles: 3 };
 
-	return {
+	const result: Config = {
 		protectedPaths: mergeProtectedPaths(protectedPathsLayers),
 		commandRules: mergeCommandRules(commandRulesLayers),
 		allowedExternal: mergeAllowedExternal(allowedExternalLayers),
 		audit: auditConfig,
 		cwd,
 	};
+
+	// Security warnings for weak configurations
+	if (result.protectedPaths.patterns.length === 0) {
+		console.error("[pi-secured-setup] WARNING: No protected path patterns are active. Sensitive files like .env, *.key, and *.pem will not be guarded.");
+	}
+	for (const pattern of result.commandRules.safe) {
+		if (pattern === ".*" || pattern === "^.*$") {
+			console.error(`[pi-secured-setup] WARNING: Overly broad safe command pattern "${pattern}" detected. All commands will be classified as safe.`);
+		}
+	}
+
+	return result;
 }
 
 /**
@@ -253,11 +267,11 @@ export function allowExternalPath(path: string): { ok: boolean; message: string 
 	// Normalise the path
 	const normalised = expandTilde(path);
 
-	if (config.paths.includes(normalised) || config.paths.includes(path)) {
+	if (config.paths.some((p) => expandTilde(p) === normalised)) {
 		return { ok: false, message: `Path "${path}" is already in allowed-external.json.` };
 	}
 
-	config.paths.push(path);
+	config.paths.push(normalised);
 	writeFileSync(configFile, JSON.stringify(config, null, 2) + "\n", "utf-8");
 
 	return { ok: true, message: `Added "${path}" to allowed-external.json. Reload config to apply.` };

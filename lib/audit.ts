@@ -32,7 +32,17 @@ export interface AuditEntry {
 
 // ── Audit logger ──────────────────────────────────────────────────────
 
-const AUDIT_FILE = resolve(MACHINE_CONFIG_DIR, "audit.jsonl");
+let _auditFile = resolve(MACHINE_CONFIG_DIR, "audit.jsonl");
+
+/**
+ * Override the audit file path for testing. Returns the previous value
+ * so tests can restore it in afterEach.
+ */
+export function _setAuditFileForTest(path: string): string {
+	const prev = _auditFile;
+	_auditFile = path;
+	return prev;
+}
 
 let _sessionId = "";
 
@@ -68,7 +78,7 @@ export function auditLog(
 
 	try {
 		ensureLogExists();
-		appendFileSync(AUDIT_FILE, JSON.stringify(entry) + "\n", "utf-8");
+		appendFileSync(_auditFile, JSON.stringify(entry) + "\n", "utf-8");
 		maybeRotate();
 	} catch (err) {
 		// Audit logging must never crash the extension.
@@ -79,8 +89,8 @@ export function auditLog(
 // ── Log rotation ──────────────────────────────────────────────────────
 
 function ensureLogExists(): void {
-	if (!existsSync(AUDIT_FILE)) {
-		appendFileSync(AUDIT_FILE, "", "utf-8");
+	if (!existsSync(_auditFile)) {
+		writeFileSync(_auditFile, "", { mode: 0o600 });
 	}
 }
 
@@ -100,32 +110,41 @@ function maybeRotate(): void {
 
 	let size: number;
 	try {
-		size = statSync(AUDIT_FILE).size;
+		size = statSync(_auditFile).size;
 	} catch {
 		return;
 	}
 
 	if (size < config.maxFileSize) return;
 
+	// Delete the oldest rotated file to prevent stale data and Windows rename conflicts
+	const oldestFile = `${_auditFile}.${config.maxFiles}`;
+	if (existsSync(oldestFile)) {
+		try {
+			unlinkSync(oldestFile);
+		} catch {
+			// Best-effort: on Windows this may fail if the file is locked
+		}
+	}
+
 	// Shift existing rotated files: .N → .N+1
 	for (let i = config.maxFiles - 1; i >= 1; i--) {
-		const src = `${AUDIT_FILE}.${i}`;
-		const dest = `${AUDIT_FILE}.${i + 1}`;
+		const src = `${_auditFile}.${i}`;
+		const dest = `${_auditFile}.${i + 1}`;
 		if (existsSync(src)) {
-			if (i + 1 > config.maxFiles) {
-				// Delete oldest if it would exceed maxFiles
-				continue;
-			}
 			renameSync(src, dest);
 		}
 	}
 
 	// Current → .1
-	renameSync(AUDIT_FILE, `${AUDIT_FILE}.1`);
+	renameSync(_auditFile, `${_auditFile}.1`);
 
-	// Remove files beyond maxFiles
+	// Ensure new empty log file exists with correct permissions
+	ensureLogExists();
+
+	// Remove files beyond maxFiles (cleanup of any leftover overflow files)
 	for (let i = config.maxFiles + 1; ; i++) {
-		const file = `${AUDIT_FILE}.${i}`;
+		const file = `${_auditFile}.${i}`;
 		if (!existsSync(file)) break;
 		try {
 			unlinkSync(file);
@@ -141,10 +160,10 @@ function maybeRotate(): void {
  * Read the most recent N entries from the audit log.
  */
 function readRecentEntries(limit: number): AuditEntry[] {
-	if (!existsSync(AUDIT_FILE)) return [];
+	if (!existsSync(_auditFile)) return [];
 
 	try {
-		const content = readFileSync(AUDIT_FILE, "utf-8").trim();
+		const content = readFileSync(_auditFile, "utf-8").trim();
 		if (!content) return [];
 
 		const lines = content.split("\n");
@@ -173,7 +192,7 @@ function countSessionEvents(): {
 	autoApproved: number;
 	secretsRedacted: number;
 } {
-	if (!existsSync(AUDIT_FILE)) {
+	if (!existsSync(_auditFile)) {
 		return { blocked: 0, confirmed: 0, autoApproved: 0, secretsRedacted: 0 };
 	}
 
@@ -183,7 +202,7 @@ function countSessionEvents(): {
 	let secretsRedacted = 0;
 
 	try {
-		const content = readFileSync(AUDIT_FILE, "utf-8").trim();
+		const content = readFileSync(_auditFile, "utf-8").trim();
 		if (!content) return { blocked: 0, confirmed: 0, autoApproved: 0, secretsRedacted: 0 };
 
 		const lines = content.split("\n");
@@ -274,7 +293,7 @@ function formatDashboard(): string {
 	}
 
 	lines.push("");
-	lines.push(`Log file: ${AUDIT_FILE}`);
+	lines.push(`Log file: ${_auditFile}`);
 	return lines.join("\n");
 }
 
@@ -345,13 +364,13 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 				return;
 			}
 
-			if (!existsSync(AUDIT_FILE)) {
+			if (!existsSync(_auditFile)) {
 				ctx.ui.notify("No audit log to clean.", "info");
 				return;
 			}
 
 			const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-			const content = readFileSync(AUDIT_FILE, "utf-8").trim();
+			const content = readFileSync(_auditFile, "utf-8").trim();
 			if (!content) {
 				ctx.ui.notify("Audit log is empty.", "info");
 				return;
@@ -374,7 +393,7 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 				}
 			}
 
-			writeFileSync(AUDIT_FILE, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
+			writeFileSync(_auditFile, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
 
 			auditLog("audit.clean", "info", { removed, remaining: kept.length, olderThan: cutoff });
 			ctx.ui.notify(`Cleaned audit log: removed ${removed} entries older than ${days} days.`, "info");
