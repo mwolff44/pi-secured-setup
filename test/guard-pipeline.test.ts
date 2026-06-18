@@ -1,10 +1,11 @@
 /**
- * Unit tests for lib/guard-pipeline.ts — confirm→block reason field
+ * Unit tests for lib/guard-pipeline.ts — confirm→block reason field and audit event types
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Config } from "../lib/config.js";
 import type { GuardEvaluators } from "../lib/guard-pipeline.js";
+import { verdictAuditInfo } from "../lib/guard-pipeline.js";
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
 	return {
@@ -58,5 +59,21 @@ describe("guard-pipeline: no-UI confirm verdict uses .message not .reason", () =
 			assert.ok(verdict.message.length > 0);
 			assert.equal(("reason" in verdict), false, "confirm verdict should not have .reason");
 		}
+	});
+});
+
+describe("verdictAuditInfo: blocked confirm verdicts produce .block audit type", () => {
+	it("boundary confirm verdict produces .confirm type with info severity (verdictAuditInfo)", () => {
+		const verdict = { action: "confirm" as const, message: "Read outside boundary?" };
+		const info = verdictAuditInfo("boundary", verdict);
+		assert.equal(info.type, "boundary.confirm");
+		assert.equal(info.severity, "info");
+	});
+
+	it("boundary block verdict produces .block type with warning severity", () => {
+		const verdict = { action: "block" as const, reason: "write outside boundary" };
+		const info = verdictAuditInfo("boundary", verdict);
+		assert.equal(info.type, "boundary.block");
+		assert.equal(info.severity, "warning");
 	});
 });

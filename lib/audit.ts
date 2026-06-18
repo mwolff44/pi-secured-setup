@@ -107,6 +107,16 @@ function maybeRotate(): void {
 
 	if (size < config.maxFileSize) return;
 
+	// Delete the oldest rotated file to prevent stale data and Windows rename conflicts
+	const oldestFile = `${AUDIT_FILE}.${config.maxFiles}`;
+	if (existsSync(oldestFile)) {
+		try {
+			unlinkSync(oldestFile);
+		} catch {
+			// Best-effort: on Windows this may fail if the file is locked
+		}
+	}
+
 	// Shift existing rotated files: .N → .N+1
 	for (let i = config.maxFiles - 1; i >= 1; i--) {
 		const src = `${AUDIT_FILE}.${i}`;
@@ -122,7 +132,7 @@ function maybeRotate(): void {
 	// Ensure new empty log file exists with correct permissions
 	ensureLogExists();
 
-	// Remove files beyond maxFiles
+	// Remove files beyond maxFiles (cleanup of any leftover overflow files)
 	for (let i = config.maxFiles + 1; ; i++) {
 		const file = `${AUDIT_FILE}.${i}`;
 		if (!existsSync(file)) break;

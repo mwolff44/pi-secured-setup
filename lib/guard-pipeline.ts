@@ -22,7 +22,7 @@ import { redactString } from "./secret-scanner.js";
 /**
  * The audit event type prefix and severity for each verdict.
  */
-function verdictAuditInfo(
+export function verdictAuditInfo(
 	guard: string,
 	verdict: GuardVerdict & { category?: string },
 ): { type: string; severity: AuditSeverity } {
@@ -93,15 +93,14 @@ export function registerGuardPipeline(
 
 		if (boundaryVerdict.action === "confirm") {
 			if (!ctx.hasUI) {
-				const { type, severity } = verdictAuditInfo("boundary", boundaryVerdict);
-				auditLog(type, severity, {
+				auditLog("boundary.block", "warning", {
 					tool: toolName,
 					path: input.path ?? "",
 					boundary: config.cwd,
 					reason: "blocked (no UI for confirmation)",
 				});
-			return { block: true, reason: boundaryVerdict.message };
-		}
+				return { block: true, reason: boundaryVerdict.message };
+			}
 
 			const approved = await ctx.ui.confirm("🔒 Boundary Check", boundaryVerdict.message);
 			if (!approved) {

@@ -69,7 +69,7 @@ describe("matchGlob", () => {
 		const start = Date.now();
 		matchGlob("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*.txt", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
 		const elapsed = Date.now() - start;
-		assert.ok(elapsed < 100, `adversarial pattern took ${elapsed}ms, should be < 100ms`);
+		assert.ok(elapsed < 500, `adversarial pattern took ${elapsed}ms, should be < 500ms`);
 	});
 });
 

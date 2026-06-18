@@ -1,8 +1,11 @@
 /**
  * Unit tests for lib/audit.ts — rotation logic and severity types
  */
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, rmSync, mkdirSync, writeFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { initAuditLog, auditLog } from "../lib/audit.js";
 
 describe("audit severity types", () => {
