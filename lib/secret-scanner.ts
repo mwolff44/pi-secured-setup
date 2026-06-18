@@ -47,7 +47,7 @@ const SECRET_PATTERNS: SecretPattern[] = [
 	},
 	{
 		name: "password",
-		pattern: /(?:password|passwd|pwd)\s*[:=]\s*["'][^"']{8,}["']/gi,
+		pattern: /(?:password|passwd|pwd)\s*[:=]\s*["']?[A-Za-z0-9+/=_!@#$%^&*()\-]{8,}["']?/gi,
 	},
 
 	// Database connection strings
@@ -58,7 +58,6 @@ const SECRET_PATTERNS: SecretPattern[] = [
 
 	// GitHub tokens
 	{ name: "github-token", pattern: /gh[ps]_[a-zA-Z0-9]{36}/g },
-	{ name: "github-pat", pattern: /ghp_[a-zA-Z0-9]{36}/g },
 
 	// Slack, Discord, etc.
 	{ name: "slack-token", pattern: /xox[baprs]-[0-9a-zA-Z-]{10,}/g },
@@ -125,51 +124,90 @@ export function isCommentLine(text: string): boolean {
 
 // ── Redaction logic ───────────────────────────────────────────────────
 
-interface Redaction {
+export interface Redaction {
 	patternName: string;
 	original: string;
 }
 
 /**
- * Scan and redact secrets from a single string value.
- * Returns the redacted string and a list of redactions performed.
+ * Regex that matches an entire PEM private key block, from BEGIN to END.
+ * Captures the full block including body and END line.
  */
-export function redactString(value: string): { result: string; redactions: Redaction[] } {
-	// Skip comment lines entirely
-	if (isCommentLine(value)) {
-		return { result: value, redactions: [] };
-	}
+const PEM_BLOCK_REGEX = /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g;
 
-	let result = value;
+/**
+ * Redact PEM private key blocks from a string before line-by-line processing.
+ * PEM keys span multiple lines and must be replaced as a single unit.
+ */
+function redactPEMBlocks(value: string): { result: string; redactions: Redaction[] } {
+	const redactions: Redaction[] = [];
+	const result = value.replace(PEM_BLOCK_REGEX, (match) => {
+		redactions.push({ patternName: "private-key", original: match });
+		return "***REDACTED:private-key***";
+	});
+	return { result, redactions };
+}
+
+/**
+ * Scan and redact secrets from a single line (no comment check).
+ * Used internally by redactString for per-line processing.
+ */
+function redactLineContent(line: string): { result: string; redactions: Redaction[] } {
+	let result = line;
 	const redactions: Redaction[] = [];
 
 	for (const { name, pattern } of SECRET_PATTERNS) {
-		// Reset lastIndex for global regexes
 		const regex = new RegExp(pattern.source, pattern.flags);
 
 		let match: RegExpExecArray | null;
 		while ((match = regex.exec(result)) !== null) {
 			const matched = match[0];
 
-			// Skip false positives
 			if (isPlaceholder(matched)) continue;
 
 			const replacement = `***REDACTED:${name}***`;
 			redactions.push({ patternName: name, original: matched });
 
-			// Replace this specific occurrence in the result string
-			// We need to be careful with global regex replacement — use the match index
 			result =
 				result.slice(0, match.index) +
 				replacement +
 				result.slice(match.index + matched.length);
 
-			// Adjust regex position after replacement (replacement is shorter/longer)
 			regex.lastIndex = match.index + replacement.length;
 		}
 	}
 
 	return { result, redactions };
+}
+
+/**
+ * Scan and redact secrets from a string value.
+ * First redacts multi-line PEM private key blocks as a whole,
+ * then processes remaining content line-by-line.
+ * Only individual comment lines are skipped; non-comment lines
+ * have secrets redacted normally.
+ * Returns the redacted string and a list of redactions performed.
+ */
+export function redactString(value: string): { result: string; redactions: Redaction[] } {
+	// Step 1: Redact multi-line PEM blocks before line-by-line processing
+	const { result: pemRedacted, redactions: pemRedactions } = redactPEMBlocks(value);
+	const allRedactions: Redaction[] = [...pemRedactions];
+
+	// Step 2: Line-by-line processing for remaining secrets
+	const lines = pemRedacted.split("\n");
+	const resultLines: string[] = [];
+
+	for (const line of lines) {
+		if (isCommentLine(line)) {
+			resultLines.push(line);
+		} else {
+			const { result, redactions } = redactLineContent(line);
+			resultLines.push(result);
+			allRedactions.push(...redactions);
+		}
+	}
+
+	return { result: resultLines.join("\n"), redactions: allRedactions };
 }
 
 /**

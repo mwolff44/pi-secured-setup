@@ -80,7 +80,7 @@ export function auditLog(
 
 function ensureLogExists(): void {
 	if (!existsSync(AUDIT_FILE)) {
-		appendFileSync(AUDIT_FILE, "", "utf-8");
+		writeFileSync(AUDIT_FILE, "", { mode: 0o600 });
 	}
 }
 
@@ -113,7 +113,12 @@ function maybeRotate(): void {
 		const dest = `${AUDIT_FILE}.${i + 1}`;
 		if (existsSync(src)) {
 			if (i + 1 > config.maxFiles) {
-				// Delete oldest if it would exceed maxFiles
+				// Delete oldest file that would exceed maxFiles
+				try {
+					unlinkSync(src);
+				} catch {
+					// File may have already been removed
+				}
 				continue;
 			}
 			renameSync(src, dest);
@@ -122,6 +127,9 @@ function maybeRotate(): void {
 
 	// Current → .1
 	renameSync(AUDIT_FILE, `${AUDIT_FILE}.1`);
+
+	// Ensure new empty log file exists with correct permissions
+	ensureLogExists();
 
 	// Remove files beyond maxFiles
 	for (let i = config.maxFiles + 1; ; i++) {

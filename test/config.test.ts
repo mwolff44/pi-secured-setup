@@ -50,4 +50,9 @@ describe("mergePatterns", () => {
 		const result = mergePatterns([["a"], ["a"]]);
 		assert.deepEqual(result, ["a", "a"]);
 	});
+
+	it("excludes patterns case-insensitively", () => {
+		const result = mergePatterns([["*.pem"], ["!*.PEM"]]);
+		assert.deepEqual(result, [], "case-insensitive exclusion should remove *.pem");
+	});
 });

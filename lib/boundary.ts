@@ -29,11 +29,13 @@ export function evaluateBoundary(
 	input: Record<string, unknown>,
 	config: Config,
 ): GuardVerdict {
+	const normalisedTool = toolName.toLowerCase();
+
 	// ADR-0003: bash is not subject to boundary enforcement
-	if (toolName === "bash") return { action: "allow" };
+	if (normalisedTool === "bash") return { action: "allow" };
 
 	// Only applies to path-based tools
-	if (toolName !== "read" && toolName !== "write" && toolName !== "edit") {
+	if (normalisedTool !== "read" && normalisedTool !== "write" && normalisedTool !== "edit") {
 		return { action: "allow" };
 	}
 
@@ -56,7 +58,7 @@ export function evaluateBoundary(
 	}
 
 	// Outside boundary — apply tool-specific action
-	if (toolName === "write" || toolName === "edit") {
+	if (normalisedTool === "write" || normalisedTool === "edit") {
 		return {
 			action: "block",
 			reason: `write outside project boundary (${targetPath})`,

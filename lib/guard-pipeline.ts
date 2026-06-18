@@ -17,6 +17,7 @@ import { evaluateBoundary } from "./boundary.js";
 import { evaluateProtectedPaths } from "./protected-paths.js";
 import { classifyCommand } from "./bash-gate.js";
 import { auditLog, type AuditSeverity } from "./audit.js";
+import { redactString } from "./secret-scanner.js";
 
 /**
  * The audit event type prefix and severity for each verdict.
@@ -69,7 +70,7 @@ export function registerGuardPipeline(
 ): void {
 	pi.on("tool_call", async (event, ctx) => {
 		const config = getConfig();
-		const toolName = event.toolName;
+		const toolName = (event.toolName as string).toLowerCase();
 		const input = event.input as Record<string, unknown>;
 
 		// ── Step 1: Boundary ────────────────────────────────────────
@@ -93,7 +94,7 @@ export function registerGuardPipeline(
 		if (boundaryVerdict.action === "confirm") {
 			if (!ctx.hasUI) {
 				const { type, severity } = verdictAuditInfo("boundary", boundaryVerdict);
-				auditLog(type, "warning", {
+				auditLog(type, severity, {
 					tool: toolName,
 					path: input.path ?? "",
 					boundary: config.cwd,
@@ -168,6 +169,7 @@ export function registerGuardPipeline(
 			const command = input.command as string | undefined;
 			if (!command) return undefined;
 
+			const safeCommand = redactString(command).result;
 			const bashVerdict = guards.classifyCommand(command, config);
 
 			// Auto-approve safe and moderate
@@ -175,7 +177,7 @@ export function registerGuardPipeline(
 				const { type, severity } = verdictAuditInfo("bash", bashVerdict);
 				auditLog(type, severity, {
 					tool: "bash",
-					command,
+					command: safeCommand,
 					category: bashVerdict.category ?? "unknown",
 				});
 				return undefined; // pass through
@@ -186,7 +188,7 @@ export function registerGuardPipeline(
 				if (!ctx.hasUI) {
 					auditLog("bash.unknown.block", "warning", {
 						tool: "bash",
-						command,
+						command: safeCommand,
 						reason: "blocked (no UI for confirmation)",
 					});
 					return { block: true, reason: "Unknown command blocked (no UI)" };
@@ -198,7 +200,7 @@ export function registerGuardPipeline(
 				if (!approved) {
 					auditLog(`bash.${category}.block`, "warning", {
 						tool: "bash",
-						command,
+						command: safeCommand,
 						category,
 						reason: "user denied",
 					});
@@ -207,7 +209,7 @@ export function registerGuardPipeline(
 
 				auditLog(`bash.${category}.confirm`, "info", {
 					tool: "bash",
-					command,
+					command: safeCommand,
 					category,
 				});
 			}

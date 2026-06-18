@@ -8,6 +8,7 @@ import {
 	resolvePath,
 	isInsideDir,
 	sha256,
+	generateSessionId,
 } from "../lib/utils.js";
 
 describe("expandTilde", () => {
@@ -79,5 +80,21 @@ describe("sha256", () => {
 
 	it("different inputs produce different hashes", () => {
 		assert.notEqual(sha256("foo"), sha256("bar"));
+	});
+});
+
+describe("generateSessionId", () => {
+	it("returns unique session IDs", () => {
+		const id1 = generateSessionId();
+		const id2 = generateSessionId();
+		assert.notEqual(id1, id2);
+	});
+
+	it("includes a crypto-random hex segment", () => {
+		const id = generateSessionId();
+		const parts = id.split("-");
+		assert.ok(parts.length >= 2, "session ID should have at least 2 parts");
+		assert.ok(parts[1].length === 8, "random segment should be 8 hex chars");
+		assert.ok(/^[0-9a-f]{8}$/.test(parts[1]), "random segment should be hex");
 	});
 });

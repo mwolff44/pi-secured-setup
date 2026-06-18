@@ -19,6 +19,16 @@ import { auditLog, setSkillStatusFn } from "./audit.js";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
+interface SkillScannerContext {
+	hasUI: boolean;
+	ui: {
+		notify(message: string, severity: string): void;
+		confirm(title: string, message: string): Promise<boolean>;
+		select(title: string, options: string[]): Promise<string>;
+	};
+	cwd?: string;
+}
+
 interface SkillApproval {
 	path: string;
 	hash: string;
@@ -50,6 +60,34 @@ function loadApprovals(): SkillApprovalsDb {
 
 function saveApprovals(db: SkillApprovalsDb): void {
 	writeFileSync(APPROVALS_FILE, JSON.stringify(db, null, 2) + "\n", "utf-8");
+}
+
+/**
+ * Migrate old name-based keys to path-based keys.
+ * Discovers all skills and re-keys any entry whose key matches a skill name
+ * but differs from the skill's path.
+ */
+function migrateNameBasedKeys(db: SkillApprovalsDb, cwd: string): SkillApprovalsDb {
+	const skills = discoverAllSkills(cwd);
+	const migrated = { ...db.skills };
+	let changed = false;
+
+	for (const skill of skills) {
+		// If there's an entry keyed by name but not by path, migrate it
+		const nameEntry = migrated[skill.name];
+		const pathEntry = migrated[skill.skillMdPath];
+		if (nameEntry && !pathEntry) {
+			migrated[skill.skillMdPath] = nameEntry;
+			delete migrated[skill.name];
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		db.skills = migrated;
+		saveApprovals(db);
+	}
+	return db;
 }
 
 // ── Skill discovery ───────────────────────────────────────────────────
@@ -146,7 +184,7 @@ function generateAlerts(
 		}
 
 		const currentHash = "sha256:" + sha256(content);
-		const existing = db.skills[skill.name];
+		const existing = db.skills[skill.skillMdPath];
 
 		if (!existing) {
 			// New skill — no entry in DB
@@ -173,12 +211,12 @@ function generateAlerts(
 async function runApprovalFlow(
 	alerts: SkillAlert[],
 	db: SkillApprovalsDb,
-	ctx: { hasUI: boolean; ui: any },
+	ctx: SkillScannerContext,
 	forAll: boolean = false,
 ): Promise<SkillApprovalsDb> {
 	// Separate actionable alerts from notification-only
-	const actionable = alerts.filter((a) => a.type === "new" || a.type === "changed" || forceAll(a, forAll));
-	const notificationOnly = alerts.filter((a) => a.type === "unapproved" && !forceAll(a, forAll));
+	const actionable = alerts.filter((a) => a.type === "new" || a.type === "changed" || forAll);
+	const notificationOnly = alerts.filter((a) => a.type === "unapproved" && !forAll);
 
 	// Show notification for previously unapproved skills (not blocking)
 	if (notificationOnly.length > 0 && ctx.hasUI) {
@@ -250,7 +288,7 @@ async function runApprovalFlow(
 		const now = new Date().toISOString();
 
 		if (choice === "Approve") {
-			db.skills[alert.skill.name] = {
+			db.skills[alert.skill.skillMdPath] = {
 				path: alert.skill.skillMdPath,
 				hash: alert.currentHash,
 				approvedAt: now,
@@ -263,7 +301,7 @@ async function runApprovalFlow(
 				hash: alert.currentHash,
 			});
 		} else if (choice === "Deny") {
-			db.skills[alert.skill.name] = {
+			db.skills[alert.skill.skillMdPath] = {
 				path: alert.skill.skillMdPath,
 				hash: alert.currentHash,
 				approvedAt: null,
@@ -276,7 +314,7 @@ async function runApprovalFlow(
 			});
 		} else {
 			// Skip — update hash but don't mark as approved
-			db.skills[alert.skill.name] = {
+			db.skills[alert.skill.skillMdPath] = {
 				path: alert.skill.skillMdPath,
 				hash: alert.currentHash,
 				approvedAt: null,
@@ -294,15 +332,17 @@ async function runApprovalFlow(
 	return db;
 }
 
-function forceAll(_alert: SkillAlert, forAll: boolean): boolean {
-	return forAll;
-}
+
 
 /**
  * Trust a skill by name — persist approval to config.
  * Called by the `/security:trust` command.
  */
 export function trustSkill(skillName: string): { ok: boolean; message: string } {
+	if (!/^[a-zA-Z0-9_-]+$/.test(skillName)) {
+		return { ok: false, message: "Skill name must be alphanumeric with hyphens/underscores." };
+	}
+
 	// Find the skill across all directories
 	const allSkills = discoverAllSkills(process.cwd());
 	const skill = allSkills.find((s) => s.name === skillName);
@@ -321,7 +361,7 @@ export function trustSkill(skillName: string): { ok: boolean; message: string } 
 	const currentHash = "sha256:" + sha256(content);
 	const db = loadApprovals();
 
-	db.skills[skillName] = {
+	db.skills[skill.skillMdPath] = {
 		path: skill.skillMdPath,
 		hash: currentHash,
 		approvedAt: new Date().toISOString(),
@@ -385,7 +425,8 @@ export function registerSkillScanner(
 	pi.on("session_start", async (_event, ctx) => {
 		const config = getConfig();
 		const skills = discoverAllSkills(config.cwd);
-		const db = loadApprovals();
+		let db = loadApprovals();
+		db = migrateNameBasedKeys(db, config.cwd);
 		const alerts = generateAlerts(skills, db);
 
 		if (alerts.length === 0) return; // All clean
@@ -413,12 +454,9 @@ export function registerSkillScanner(
  * Re-trigger the full skill approval flow for all skills.
  * Called by the `/security:skills` command.
  */
-export async function triggerSkillReview(ctx: {
-	hasUI: boolean;
-	ui: any;
-	cwd: string;
-}): Promise<void> {
-	const skills = discoverAllSkills(ctx.cwd);
+export async function triggerSkillReview(ctx: SkillScannerContext): Promise<void> {
+	const cwd = ctx.cwd ?? process.cwd();
+	const skills = discoverAllSkills(cwd);
 	const db = loadApprovals();
 
 	// Force review of all skills regardless of status
@@ -431,7 +469,7 @@ export async function triggerSkillReview(ctx: {
 		}
 
 		const currentHash = "sha256:" + sha256(content);
-		const existing = db.skills[skill.name];
+		const existing = db.skills[skill.skillMdPath];
 		const type: SkillAlertType =
 			!existing ? "new" :
 			existing.status !== "approved" ? "unapproved" :

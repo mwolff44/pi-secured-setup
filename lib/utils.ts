@@ -1,7 +1,7 @@
 /**
  * Shared utilities for the pi-secured-setup extension.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { resolve, normalize, dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -83,6 +83,6 @@ let _sessionCounter = 0;
 export function generateSessionId(): string {
 	_sessionCounter++;
 	const ts = Date.now().toString(36);
-	const rand = Math.random().toString(36).slice(2, 8);
+	const rand = randomBytes(4).toString("hex");
 	return `${ts}-${rand}-${_sessionCounter}`;
 }

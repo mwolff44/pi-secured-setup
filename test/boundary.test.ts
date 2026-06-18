@@ -90,4 +90,16 @@ describe("evaluateBoundary", () => {
 		const result = evaluateBoundary("read", {}, config);
 		assert.equal(result.action, "allow");
 	});
+
+	it("handles uppercase tool name 'Read' same as 'read'", () => {
+		const config = makeConfig();
+		const result = evaluateBoundary("Read", { path: "/home/user/other-project/file.ts" }, config);
+		assert.equal(result.action, "confirm");
+	});
+
+	it("handles uppercase tool name 'WRITE' same as 'write'", () => {
+		const config = makeConfig();
+		const result = evaluateBoundary("WRITE", { path: "/home/user/other-project/file.ts" }, config);
+		assert.equal(result.action, "block");
+	});
 });
