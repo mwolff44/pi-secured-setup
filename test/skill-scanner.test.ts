@@ -35,8 +35,10 @@ describe("migrateNameBasedKeys", () => {
 
 	it("preserves name-based keys when skill directory is not discoverable", () => {
 		// Simulate an old DB keyed by skill name
-		const nameKey = "my-skill";
-		const pathKey = "/home/user/.pi/agent/skills/my-skill/SKILL.md";
+		// Use a collision-resistant name to avoid nondeterministic failure
+		// if a developer happens to have a real skill with this name installed
+		const nameKey = "__pi-test-nonexistent-skill-7f3a__";
+		const pathKey = `/home/user/.pi/agent/skills/${nameKey}/SKILL.md`;
 		const db = makeDb({
 			[nameKey]: {
 				path: pathKey,
