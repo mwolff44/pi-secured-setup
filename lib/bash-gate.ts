@@ -99,14 +99,12 @@ export function splitCommand(command: string): string[] {
 				current += command[i];
 				i++;
 			}
-			// Extract inner command
-			segments.push(current.trim());
+			// Extract inner command for separate classification
 			const innerStart = start + 2;
 			const innerEnd = i - 1;
 			if (innerEnd > innerStart) {
 				segments.push(command.slice(innerStart, innerEnd).trim());
 			}
-			current = "";
 			continue;
 		}
 

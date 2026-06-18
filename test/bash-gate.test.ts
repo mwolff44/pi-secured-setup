@@ -91,6 +91,40 @@ describe("splitCommand", () => {
 		assert.ok(parts.some((p: string) => p.trim() === "ls"));
 		assert.ok(parts.some((p: string) => p.includes("echo fallback")));
 	});
+
+	it("continues accumulating after $(...) — text after subshell stays in same segment", () => {
+		// Copilot review #1: echo $(whoami) foo should NOT produce 'foo' as a separate segment
+		const parts = splitCommand("echo $(whoami) foo");
+		// Must include the full "echo $(whoami) foo" as one segment
+		assert.ok(
+			parts.some((p: string) => p === "echo $(whoami) foo"),
+			`Expected 'echo $(whoami) foo' as a segment, got: ${JSON.stringify(parts)}`,
+		);
+		// Must include the inner subshell command for classification
+		assert.ok(
+			parts.some((p: string) => p === "whoami"),
+			`Expected 'whoami' as a segment, got: ${JSON.stringify(parts)}`,
+		);
+		// 'foo' must NOT appear as its own top-level segment
+		assert.ok(
+			!parts.some((p: string) => p === "foo"),
+			`'foo' should not be a standalone segment, got: ${JSON.stringify(parts)}`,
+		);
+	});
+
+	it("handles $(...) at end of command without creating empty trailing segment", () => {
+		const parts = splitCommand("echo $(whoami)");
+		assert.ok(parts.some((p: string) => p === "echo $(whoami)"));
+		assert.ok(parts.some((p: string) => p === "whoami"));
+	});
+
+	it("handles multiple $(...) in one segment", () => {
+		const parts = splitCommand("echo $(whoami) && echo $(hostname)");
+		assert.ok(parts.some((p: string) => p === "echo $(whoami)"));
+		assert.ok(parts.some((p: string) => p === "whoami"));
+		assert.ok(parts.some((p: string) => p === "echo $(hostname)"));
+		assert.ok(parts.some((p: string) => p === "hostname"));
+	});
 });
 
 describe("classifySegment", () => {

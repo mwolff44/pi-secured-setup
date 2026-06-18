@@ -67,7 +67,7 @@ function saveApprovals(db: SkillApprovalsDb): void {
  * Discovers all skills and re-keys any entry whose key matches a skill name
  * but differs from the skill's path.
  */
-function migrateNameBasedKeys(db: SkillApprovalsDb, cwd: string): SkillApprovalsDb {
+export function migrateNameBasedKeys(db: SkillApprovalsDb, cwd: string): SkillApprovalsDb {
 	const skills = discoverAllSkills(cwd);
 	const migrated = { ...db.skills };
 	let changed = false;
@@ -457,7 +457,8 @@ export function registerSkillScanner(
 export async function triggerSkillReview(ctx: SkillScannerContext): Promise<void> {
 	const cwd = ctx.cwd ?? process.cwd();
 	const skills = discoverAllSkills(cwd);
-	const db = loadApprovals();
+	let db = loadApprovals();
+	db = migrateNameBasedKeys(db, cwd);
 
 	// Force review of all skills regardless of status
 	const allAlerts: SkillAlert[] = skills.map((skill) => {
