@@ -20,5 +20,10 @@
   },
   "devDependencies": {
     "tsx": "^4.22.4"
+  },
+  "overrides": {
+    "undici": "^8.5.0",
+    "protobufjs": "^7.6.3",
+    "ws": "^8.21.0"
   }
 }
