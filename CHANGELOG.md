@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-06-22
+
+### Changed
+- Bumped peer dependencies `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` from `^0.79.6` to `^0.79.9`
+- Synchronized `package-lock.json` with the peer dependency bump
+
+### Security
+- Resolved 10 Dependabot advisories that remained in `@earendil-works/pi-coding-agent@0.79.6` bundled copies, now fixed by the upstream `0.79.9` release
+- `undici` (7): GHSA-vxpw-j846-p89q, GHSA-38rv-x7px-6hhq, GHSA-vmh5-mc38-953g, GHSA-p88m-4jfj-68fv, GHSA-pr7r-676h-xcf6, GHSA-g8m3-5g58-fq7m, GHSA-35p6-xmwp-9g52
+- `protobufjs` (2): GHSA-wcpc-wj8m-hjx6, GHSA-f38q-mgvj-vph7
+- `ws` (1): GHSA-96hv-2xvq-fx4p
+
 ## [1.0.2] - 2026-06-18
 
 ### Fixed
