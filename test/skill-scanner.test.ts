@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { migrateNameBasedKeys } from "../lib/skill-scanner.js";
+import { migrateNameBasedKeys, _setApprovalsFileForTest } from "../lib/skill-scanner.js";
 import type { SkillApprovalsDb } from "../lib/skill-scanner.js";
 
 function makeDb(skills: SkillApprovalsDb["skills"] = {}): SkillApprovalsDb {
@@ -15,13 +15,18 @@ function makeDb(skills: SkillApprovalsDb["skills"] = {}): SkillApprovalsDb {
 
 describe("migrateNameBasedKeys", () => {
 	let tempDir: string;
+	let previousApprovalsFile: string;
 
 	beforeEach(() => {
 		tempDir = resolve(tmpdir(), `pi-skill-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		// Override the approvals file to a temp path so saveApprovals()
+		// doesn't write to the developer's real ~/.pi/agent/security/ dir.
+		previousApprovalsFile = _setApprovalsFileForTest(resolve(tempDir, "skill-approvals.json"));
 	});
 
 	afterEach(() => {
+		_setApprovalsFileForTest(previousApprovalsFile);
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

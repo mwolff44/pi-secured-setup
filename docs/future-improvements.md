@@ -1,6 +1,6 @@
 # Future Improvements — New APIs from Dependency Updates
 
-This document lists new APIs available after the 0.74.0 → 0.79.6 upgrade of `@earendil-works/pi-coding-agent` and how they could enhance pi-secured-setup.
+This document lists new APIs available after the 0.74.0 → 0.82.1 upgrade of `@earendil-works/pi-coding-agent` and how they could enhance pi-secured-setup.
 
 ---
 

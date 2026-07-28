@@ -1,6 +1,6 @@
 {
   "name": "pi-secured-setup",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Security extension for pi-agent: boundary enforcement, secret detection, skill verification, and audit logging",
   "keywords": [
     "pi-package"
@@ -14,9 +14,9 @@
     "test": "tsx --test test/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.79.9",
-    "@earendil-works/pi-coding-agent": "^0.79.9",
-    "@earendil-works/pi-tui": "^0.79.9"
+    "@earendil-works/pi-ai": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@earendil-works/pi-tui": "^0.82.1"
   },
   "devDependencies": {
     "tsx": "^4.22.4"
