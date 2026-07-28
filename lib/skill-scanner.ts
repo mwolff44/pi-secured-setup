@@ -44,14 +44,24 @@ export interface SkillApprovalsDb {
 
 // ── Approvals DB ──────────────────────────────────────────────────────
 
-const APPROVALS_FILE = resolve(MACHINE_CONFIG_DIR, "skill-approvals.json");
+let _approvalsFile = resolve(MACHINE_CONFIG_DIR, "skill-approvals.json");
+
+/**
+ * Override the approvals file path for testing. Returns the previous value
+ * so tests can restore it in afterEach.
+ */
+export function _setApprovalsFileForTest(path: string): string {
+	const prev = _approvalsFile;
+	_approvalsFile = path;
+	return prev;
+}
 
 function loadApprovals(): SkillApprovalsDb {
-	if (!existsSync(APPROVALS_FILE)) {
+	if (!existsSync(_approvalsFile)) {
 		return { version: 1, skills: {} };
 	}
 	try {
-		const raw = readFileSync(APPROVALS_FILE, "utf-8");
+		const raw = readFileSync(_approvalsFile, "utf-8");
 		return JSON.parse(raw) as SkillApprovalsDb;
 	} catch {
 		return { version: 1, skills: {} };
@@ -59,7 +69,7 @@ function loadApprovals(): SkillApprovalsDb {
 }
 
 function saveApprovals(db: SkillApprovalsDb): void {
-	writeFileSync(APPROVALS_FILE, JSON.stringify(db, null, 2) + "\n", "utf-8");
+	writeFileSync(_approvalsFile, JSON.stringify(db, null, 2) + "\n", "utf-8");
 }
 
 /**

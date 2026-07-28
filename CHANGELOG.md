@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-07-28
+
+### Changed
+- Bumped peer dependencies `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` from `^0.79.9` to `^0.82.1`
+- Synchronized `package-lock.json` with the peer dependency bump
+
+### Notes
+- No breaking API changes affect this extension. The v0.82.1 release adds Claude Opus 5 support, Anthropic gateway bearer auth, and faster model catalogs — none of which alter the `ExtensionAPI` surface used by the guards or scanners (`tool_call`, `session_start`, `before_provider_request`, `after_provider_response`, `turn_start`, `registerCommand`).
+- The `outputPad` setting exposed to custom message renderers is additive and does not affect this extension.
+
 ## [1.0.3] - 2026-06-22
 
 ### Changed
