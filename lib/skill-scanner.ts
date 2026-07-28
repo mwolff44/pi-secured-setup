@@ -10,8 +10,8 @@
  * by the bash Guard.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Config } from "./config.js";
 import { MACHINE_CONFIG_DIR, sha256 } from "./utils.js";
@@ -69,6 +69,7 @@ function loadApprovals(): SkillApprovalsDb {
 }
 
 function saveApprovals(db: SkillApprovalsDb): void {
+	mkdirSync(dirname(_approvalsFile), { recursive: true });
 	writeFileSync(_approvalsFile, JSON.stringify(db, null, 2) + "\n", "utf-8");
 }
 
