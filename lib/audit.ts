@@ -350,6 +350,16 @@ function computeChainStateAndMigrate(key: Buffer | null): {
  * Internal: append a single chained entry to the current file. Used by
  * both `auditLog` (user events) and `maybeRotate` (the `audit.roll` seal).
  * Does NOT trigger rotation.
+ *
+ * SECURITY: this path is intentionally NOT rate-limited. For a
+ * tamper-evident forensic log, silently dropping an entry when a rate
+ * budget is exhausted would be an anti-pattern: an attacker who triggers
+ * a flood could suppress the evidence of their real actions by pushing
+ * legitimate entries out of the window. The real DoS surface (disk fill)
+ * is already bounded by rotation (`maxFileSize` × `maxFiles` ≈ 30 MB
+ * cap), and the write rate is already indirectly bounded by the
+ * `tool_calls`-per-turn cap, since every audited Guard event originates
+ * from a rate-limited tool call. See ADR-0010.
  */
 function appendChained(
 	type: string,

@@ -1,14 +1,19 @@
 /**
- * In-memory rate limiter for tool calls, confirmations, and audit writes.
+ * In-memory rate limiter for tool calls and confirmations.
  *
- * Three scopes with independent lifecycles:
+ * Two scopes with independent lifecycles:
  *   - `tool_calls`    — per turn, reset by `resetTurn()` on `turn_start`
  *   - `confirmations` — per session, cumulative, reset by `resetSession()`
- *   - `audit_writes`  — sliding 1-second window
  *
  * Monotonic counters; no external state. Fail-closed: when a limit is
  * exceeded, `checkLimit` returns `{ allowed: false }` and the caller is
  * expected to block the action (see the guard-pipeline integration).
+ *
+ * Audit log writes are intentionally NOT a rate-limit scope: silently
+ * dropping forensic entries when over budget would let an attacker
+ * suppress evidence of their actions by flooding the log. Disk usage
+ * is bounded by rotation; write rate is indirectly bounded by the
+ * `tool_calls` per-turn cap. See ADR-0010.
  *
  * The limits object is supplied by the caller. Runtime config loads it
  * machine-only from `security-policy.json` via `loadSecurityPolicy` in
@@ -35,8 +40,6 @@ export interface SecurityLimits {
 	toolCallsPerTurn: number;
 	/** Max confirmation dialogs within a single session (cumulative). */
 	confirmationsPerSession: number;
-	/** Max audit log writes within any 1-second sliding window. */
-	auditWritesPerSecond: number;
 	/** Per-turn token-count anomaly threshold (metrics scanner). */
 	tokensPerTurnWarn?: number;
 	/** Sliding 1-minute tool-call-count anomaly threshold (metrics scanner). */
@@ -45,7 +48,7 @@ export interface SecurityLimits {
 	tokensSessionWarn?: number;
 }
 
-export type RateLimitScope = "tool_calls" | "confirmations" | "audit_writes";
+export type RateLimitScope = "tool_calls" | "confirmations";
 
 export interface RateLimitResult {
 	allowed: boolean;
@@ -61,19 +64,13 @@ export interface RateLimitResult {
 
 let _toolCallCount = 0;
 let _confirmationCount = 0;
-/** Timestamps (ms) of audit writes within the current sliding window. */
-const _auditWriteTimestamps: number[] = [];
-
-/** Sliding-window duration for the `audit_writes` scope. */
-const AUDIT_WINDOW_MS = 1000;
 
 /**
  * Check whether an action under `scope` is allowed given `limits`.
  *
  * Side effect: increments the relevant counter (`tool_calls` /
- * `confirmations`) or appends to the sliding window (`audit_writes`).
- * The increment happens unconditionally so the returned `count`
- * reflects the current attempt including this call.
+ * `confirmations`). The increment happens unconditionally so the
+ * returned `count` reflects the current attempt including this call.
  *
  * Semantics: the first `limit` calls within the scope's lifecycle are
  * allowed; call `limit + 1` is blocked, as is every subsequent call
@@ -110,26 +107,6 @@ export function checkLimit(
 			}
 			return { allowed: true, count: _confirmationCount, limit };
 		}
-		case "audit_writes": {
-			const now = Date.now();
-			const cutoff = now - AUDIT_WINDOW_MS;
-			// Drop timestamps that have aged out of the window.
-			while (_auditWriteTimestamps.length > 0 && _auditWriteTimestamps[0] <= cutoff) {
-				_auditWriteTimestamps.shift();
-			}
-			_auditWriteTimestamps.push(now);
-			const limit = limits.auditWritesPerSecond;
-			const count = _auditWriteTimestamps.length;
-			if (count > limit) {
-				return {
-					allowed: false,
-					count,
-					limit,
-					reason: `audit_writes rate limit exceeded (${count}/${limit} per second)`,
-				};
-			}
-			return { allowed: true, count, limit };
-		}
 	}
 }
 
@@ -149,13 +126,12 @@ export function resetSession(): void {
 }
 
 /**
- * Reset ALL counters and the audit-write window. Intended for tests to
- * isolate module state between cases.
+ * Reset ALL counters. Intended for tests to isolate module state
+ * between cases.
  */
 export function _resetAllForTest(): void {
 	_toolCallCount = 0;
 	_confirmationCount = 0;
-	_auditWriteTimestamps.length = 0;
 }
 
 /**
@@ -164,11 +140,9 @@ export function _resetAllForTest(): void {
 export function _snapshotForTest(): {
 	toolCalls: number;
 	confirmations: number;
-	auditWrites: number;
 } {
 	return {
 		toolCalls: _toolCallCount,
 		confirmations: _confirmationCount,
-		auditWrites: _auditWriteTimestamps.length,
 	};
 }

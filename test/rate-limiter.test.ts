@@ -3,7 +3,7 @@
  * the guard pipeline (P2-3: rate-limiting of tool calls / confirmations).
  *
  * Coverage:
- *   - Pure module: checkLimit across all three scopes, resetTurn,
+ *   - Pure module: checkLimit across both scopes, resetTurn,
  *     resetSession.
  *   - Integration via the guard pipeline mock pi:
  *       * exceeding toolCallsPerTurn blocks + audits ratelimit.block
@@ -132,7 +132,6 @@ describe("rate-limiter: checkLimit (tool_calls)", () => {
 		const limits = {
 			toolCallsPerTurn: 3,
 			confirmationsPerSession: 100,
-			auditWritesPerSecond: 100,
 		};
 		assert.deepEqual(checkLimit("tool_calls", limits), { allowed: true, count: 1, limit: 3 });
 		assert.deepEqual(checkLimit("tool_calls", limits), { allowed: true, count: 2, limit: 3 });
@@ -148,7 +147,6 @@ describe("rate-limiter: checkLimit (tool_calls)", () => {
 		const limits = {
 			toolCallsPerTurn: 1,
 			confirmationsPerSession: 100,
-			auditWritesPerSecond: 100,
 		};
 		checkLimit("tool_calls", limits); // 1, allowed
 		for (let i = 0; i < 5; i++) {
@@ -161,7 +159,6 @@ describe("rate-limiter: checkLimit (tool_calls)", () => {
 		const limits = {
 			toolCallsPerTurn: 2,
 			confirmationsPerSession: 100,
-			auditWritesPerSecond: 100,
 		};
 		checkLimit("tool_calls", limits);
 		checkLimit("tool_calls", limits);
@@ -179,7 +176,6 @@ describe("rate-limiter: checkLimit (confirmations)", () => {
 		const limits = {
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 2,
-			auditWritesPerSecond: 100,
 		};
 		assert.equal(checkLimit("confirmations", limits).allowed, true);
 		assert.equal(checkLimit("confirmations", limits).allowed, true);
@@ -191,7 +187,6 @@ describe("rate-limiter: checkLimit (confirmations)", () => {
 		const limits = {
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 1,
-			auditWritesPerSecond: 100,
 		};
 		checkLimit("confirmations", limits);
 		assert.equal(checkLimit("confirmations", limits).allowed, false);
@@ -203,28 +198,11 @@ describe("rate-limiter: checkLimit (confirmations)", () => {
 		const limits = {
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 1,
-			auditWritesPerSecond: 100,
 		};
 		checkLimit("confirmations", limits);
 		assert.equal(checkLimit("confirmations", limits).allowed, false);
 		resetTurn();
 		assert.equal(checkLimit("confirmations", limits).allowed, false, "confirmations are session-scoped");
-	});
-});
-
-describe("rate-limiter: checkLimit (audit_writes sliding window)", () => {
-	beforeEach(() => _resetAllForTest());
-
-	it("allows up to the per-second limit within the window", () => {
-		const limits = {
-			toolCallsPerTurn: 100,
-			confirmationsPerSession: 100,
-			auditWritesPerSecond: 3,
-		};
-		assert.equal(checkLimit("audit_writes", limits).allowed, true);
-		assert.equal(checkLimit("audit_writes", limits).allowed, true);
-		assert.equal(checkLimit("audit_writes", limits).allowed, true);
-		assert.equal(checkLimit("audit_writes", limits).allowed, false);
 	});
 });
 
@@ -266,7 +244,6 @@ describe("guard-pipeline: tool_calls rate limit (AC#1)", () => {
 				securityPolicy: {
 					toolCallsPerTurn: 2,
 					confirmationsPerSession: 100,
-					auditWritesPerSecond: 500,
 				},
 			}),
 			makeAllowGuards(),
@@ -300,7 +277,6 @@ describe("guard-pipeline: tool_calls rate limit (AC#1)", () => {
 				securityPolicy: {
 					toolCallsPerTurn: 1,
 					confirmationsPerSession: 100,
-					auditWritesPerSecond: 500,
 				},
 			}),
 			makeAllowGuards(),
@@ -347,7 +323,6 @@ describe("guard-pipeline: turn_start resets the tool_calls counter (AC#2)", () =
 				securityPolicy: {
 					toolCallsPerTurn: 2,
 					confirmationsPerSession: 100,
-					auditWritesPerSecond: 500,
 				},
 			}),
 			makeAllowGuards(),
@@ -410,7 +385,6 @@ describe("guard-pipeline: confirmations cap converts a confirm into a block (AC#
 				securityPolicy: {
 					toolCallsPerTurn: 100,
 					confirmationsPerSession: 1,
-					auditWritesPerSecond: 500,
 				},
 			}),
 			makeBoundaryConfirmGuards(),
@@ -488,7 +462,6 @@ describe("guard-pipeline: generous defaults do not block normal usage (AC#5)", (
 	it("DEFAULT_SECURITY_POLICY exposes the documented generous thresholds", () => {
 		assert.equal(DEFAULT_SECURITY_POLICY.toolCallsPerTurn, 100);
 		assert.equal(DEFAULT_SECURITY_POLICY.confirmationsPerSession, 200);
-		assert.equal(DEFAULT_SECURITY_POLICY.auditWritesPerSecond, 500);
 	});
 });
 
@@ -517,7 +490,6 @@ describe("security-policy.json — machine-only (AC#4)", () => {
 			JSON.stringify({
 				toolCallsPerTurn: 999999,
 				confirmationsPerSession: 999999,
-				auditWritesPerSecond: 999999,
 			}),
 			"utf-8",
 		);
@@ -533,11 +505,9 @@ describe("security-policy.json — machine-only (AC#4)", () => {
 		// The raised project-layer limits must NOT be applied.
 		assert.notEqual(policy.toolCallsPerTurn, 999999, "raised tool-call limit must be ignored");
 		assert.notEqual(policy.confirmationsPerSession, 999999, "raised confirmation limit must be ignored");
-		assert.notEqual(policy.auditWritesPerSecond, 999999, "raised audit limit must be ignored");
 		// Shipped defaults are still in effect.
 		assert.equal(policy.toolCallsPerTurn, DEFAULT_SECURITY_POLICY.toolCallsPerTurn);
 		assert.equal(policy.confirmationsPerSession, DEFAULT_SECURITY_POLICY.confirmationsPerSession);
-		assert.equal(policy.auditWritesPerSecond, DEFAULT_SECURITY_POLICY.auditWritesPerSecond);
 	});
 
 	it("loadConfig also ignores the project-layer policy and applies defaults", () => {
@@ -548,7 +518,6 @@ describe("security-policy.json — machine-only (AC#4)", () => {
 			JSON.stringify({
 				toolCallsPerTurn: 7,
 				confirmationsPerSession: 7,
-				auditWritesPerSecond: 7,
 			}),
 			"utf-8",
 		);

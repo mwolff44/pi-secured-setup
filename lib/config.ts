@@ -80,15 +80,16 @@ export type SecurityPolicy = SecurityLimits;
 /**
  * Shipped default rate-limiting policy. Generous thresholds that avoid
  * blocking legitimate heavy workflows while still capping runaway loops
- * (tool_calls), dialog spam (confirmations), and audit flooding
- * (audit_writes). The three trailing anomaly thresholds are consumed by
- * the metrics scanner (P2-5); they are populated here so callers reading
+ * (tool_calls) and dialog spam (confirmations). Audit writes are
+ * deliberately NOT rate-limited (see ADR-0010): silently dropping
+ * forensic entries would let an attacker suppress evidence by flooding
+ * the log. The three trailing anomaly thresholds are consumed by the
+ * metrics scanner (P2-5); they are populated here so callers reading
  * `config.securityPolicy` always see them.
  */
 export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
 	toolCallsPerTurn: 100,
 	confirmationsPerSession: 200,
-	auditWritesPerSecond: 500,
 	tokensPerTurnWarn: 8000,
 	toolCallsPerMinuteWarn: 60,
 	tokensSessionWarn: 50000,

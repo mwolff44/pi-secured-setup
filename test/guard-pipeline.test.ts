@@ -697,7 +697,6 @@ describe("guard-pipeline: ctx.mode gates interactive dialogs (P3-1)", () => {
 				securityPolicy: {
 					toolCallsPerTurn: 1,
 					confirmationsPerSession: 100,
-					auditWritesPerSecond: 500,
 				},
 			}),
 			guards,

@@ -224,7 +224,6 @@ describe("resolveMetricsThresholds", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 1000,
 			toolCallsPerMinuteWarn: 10,
 			tokensSessionWarn: 5000,
@@ -247,7 +246,6 @@ describe("resolveMetricsThresholds", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			// only tokensPerTurnWarn supplied; the other two should default
 			tokensPerTurnWarn: 4242,
 		});
@@ -261,7 +259,6 @@ describe("resolveMetricsThresholds", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 0,
 			toolCallsPerMinuteWarn: -1,
 			tokensSessionWarn: 0,
@@ -385,7 +382,6 @@ describe("registerMetricsScanner — Scanner contract", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 100, // low threshold to trigger
 			toolCallsPerMinuteWarn: 9999,
 			tokensSessionWarn: 999_999,
@@ -423,7 +419,6 @@ describe("registerMetricsScanner — Scanner contract", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 999_999,
 			toolCallsPerMinuteWarn: 2, // low threshold
 			tokensSessionWarn: 999_999,
@@ -451,7 +446,6 @@ describe("registerMetricsScanner — Scanner contract", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 999_999,
 			toolCallsPerMinuteWarn: 999_999,
 			tokensSessionWarn: 1000,
@@ -480,7 +474,6 @@ describe("registerMetricsScanner — Scanner contract", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 10_000,
 			toolCallsPerMinuteWarn: 100,
 			tokensSessionWarn: 100_000,
@@ -568,7 +561,6 @@ describe("registerMetricsScanner — Scanner contract", () => {
 		const cfg = configWithPolicy({
 			toolCallsPerTurn: 100,
 			confirmationsPerSession: 200,
-			auditWritesPerSecond: 500,
 			tokensPerTurnWarn: 1,
 			toolCallsPerMinuteWarn: 999_999,
 			tokensSessionWarn: 999_999,
