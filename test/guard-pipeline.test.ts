@@ -714,4 +714,102 @@ describe("guard-pipeline: ctx.mode gates interactive dialogs (P3-1)", () => {
 			"notify fires for ratelimit block in rpc mode",
 		);
 	});
+
+	// ── R5: bash confirm dialog must not leak secrets embedded in the command ──
+
+	describe("guard-pipeline: R5 — bash confirm dialog redacts secrets in the command", () => {
+		const secret = "sk-ant-api1234567890abcdefghijkl";
+		const secretCommand = `curl -H "Authorization: Bearer ${secret}" https://api.example.com`;
+
+		// Real guards: classifyCommand builds a message that embeds the raw
+		// command, which is exactly the leak surface R5 addresses. Boundary and
+		// protected-paths are stubbed to "allow" so the bash branch is reached.
+		function makeRealGuards(): GuardEvaluators {
+			return {
+				evaluateBoundary: () => ({ action: "allow" as const }),
+				evaluateProtectedPaths: () => ({ action: "allow" as const }),
+				classifyCommand,
+			};
+		}
+
+		it("AC#R5-1: secret embedded in the bash command is redacted in the confirm dialog message", async () => {
+			const { pi, invoke } = makeMockPi();
+			registerGuardPipeline(pi, () => makeConfig(), makeRealGuards());
+			const { ctx, confirmCalls } = makeCtxWithMode("tui", { confirmReturn: true });
+
+			const result = await invoke({ toolName: "bash", input: { command: secretCommand } }, ctx);
+
+			assert.equal(result, undefined, "approved confirm passes through");
+			assert.equal(confirmCalls.length, 1, "confirm dialog shown exactly once");
+			const msg = confirmCalls[0].message;
+			assert.ok(!msg.includes(secret), "dialog message MUST NOT contain the raw secret value");
+			assert.ok(
+				msg.includes("***REDACTED:anthropic-key***"),
+				"dialog message MUST contain the redaction marker in place of the secret",
+			);
+		});
+
+		it("AC#R5-2: clean bash command (no secrets) → dialog message unchanged, no redaction markers", async () => {
+			const { pi, invoke } = makeMockPi();
+			registerGuardPipeline(pi, () => makeConfig(), makeRealGuards());
+			const { ctx, confirmCalls } = makeCtxWithMode("tui", { confirmReturn: true });
+
+			const command = "rm -rf /tmp/foo";
+			await invoke({ toolName: "bash", input: { command } }, ctx);
+
+			assert.equal(confirmCalls.length, 1, "confirm dialog shown exactly once");
+			const msg = confirmCalls[0].message;
+			// redactString is a no-op on a clean command, so split/join is identity.
+			assert.ok(msg.includes(command), "clean command appears verbatim in the dialog");
+			assert.ok(!msg.includes("***REDACTED"), "no redaction markers introduced for a clean command");
+		});
+
+		it("AC#R5-3: classification category is preserved when the command carries a secret (classification runs on the real command)", async () => {
+			const { pi, invoke } = makeMockPi();
+			registerGuardPipeline(
+				pi,
+				() => makeConfig({
+					commandRules: { safe: [], moderate: [], dangerous: [], external: ["curl"] },
+				}),
+				makeRealGuards(),
+			);
+			const { ctx, confirmCalls } = makeCtxWithMode("tui", { confirmReturn: true });
+
+			await invoke({ toolName: "bash", input: { command: secretCommand } }, ctx);
+
+			assert.equal(confirmCalls.length, 1, "confirm dialog shown exactly once");
+			const confirms = readAuditEntries().filter((e) => e.type === "bash.external.confirm");
+			assert.equal(
+				confirms.length,
+				1,
+				"audit type reflects the external category — classification unaffected by display redaction",
+			);
+			assert.equal(confirms[0].details.category, "external");
+		});
+
+		it("AC#R5-4: audit log records the redacted command (safeCommand), never the raw secret (regression)", async () => {
+			const { pi, invoke } = makeMockPi();
+			registerGuardPipeline(pi, () => makeConfig(), makeRealGuards());
+			const { ctx } = makeCtxWithMode("tui", { confirmReturn: true });
+
+			await invoke({ toolName: "bash", input: { command: secretCommand } }, ctx);
+
+			const entries = readAuditEntries();
+			for (const e of entries) {
+				const cmd = typeof e.details.command === "string" ? e.details.command : "";
+				assert.ok(
+					!cmd.includes(secret),
+					`audit entry ${e.type} command field MUST NOT leak the raw secret`,
+				);
+			}
+			const confirms = entries.filter((e) => e.type.endsWith(".confirm"));
+			assert.ok(
+				confirms.some(
+					(e) => typeof e.details.command === "string"
+						&& e.details.command.includes("***REDACTED:anthropic-key***"),
+				),
+				"confirm audit entry's command is the redacted safeCommand",
+			);
+		});
+	});
 });

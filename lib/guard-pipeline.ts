@@ -453,7 +453,16 @@ export function registerGuardPipeline(
 				const cap = confirmationCapBlock(policy, ctx);
 				if (cap) return cap;
 
-				const approved = await ctx.ui.confirm("🔒 Bash Command", bashVerdict.message);
+				// R5: redact the command within the dialog message. The verdict
+				// message (built by classifyCommand or exfil escalation) embeds
+				// the raw command, which may carry a secret (e.g. a bearer token
+				// in a curl -H argument). Classification ran on the real command
+				// above; only the displayed copy is sanitized. Literal split/join
+				// (not regex) avoids escaping issues when the command contains
+				// regex-special characters. When there are no secrets,
+				// safeCommand === command so the message is unchanged.
+				const displayMessage = bashVerdict.message.split(command).join(safeCommand);
+				const approved = await ctx.ui.confirm("🔒 Bash Command", displayMessage);
 				const category = bashVerdict.category ?? "unknown";
 
 				if (!approved) {
