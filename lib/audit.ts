@@ -102,6 +102,14 @@ export function getSessionId(): string {
 // ── HMAC key management (ADR-0007) ────────────────────────────────────
 
 const GENESIS_HASH = "GENESIS";
+
+/**
+ * Required HMAC key length in bytes (ADR-0007). Single source of truth
+ * for both the acceptance threshold in {@link loadAuditKey} and the
+ * `randomBytes` generation call.
+ */
+const AUDIT_KEY_BYTES = 32;
+
 let _cachedKey: Buffer | null = null;
 
 /**
@@ -113,9 +121,21 @@ function getAuditKeyPath(): string {
 }
 
 /**
- * Load (or generate on first run) the 32-byte HMAC key. The key is written
- * with mode 0o600 on POSIX. Returns null if the key cannot be loaded or
- * generated — callers must handle this gracefully (append without hash).
+ * Load (or generate on first run) the {@link AUDIT_KEY_BYTES}-byte HMAC
+ * key. The key is written with mode 0o600 on POSIX. Returns null if the
+ * key cannot be loaded or generated — callers must handle this gracefully
+ * (append without hash).
+ *
+ * A pre-existing key file shorter than {@link AUDIT_KEY_BYTES} bytes is
+ * treated as a misconfiguration: a warning is logged, and a fresh
+ * {@link AUDIT_KEY_BYTES}-byte key is generated and OVERWRITES the short
+ * file. Regenerating the key means the HMAC chain can no longer verify
+ * entries signed with the old (short) key — `verifyAuditChain` will
+ * report those legacy entries as hash-mismatched. This is correct: a
+ * short key was never a trustworthy signing key, and the regenerated
+ * key starts a trustworthy chain going forward. The legacy entries
+ * remain in the append-only log but verify as broken, which honestly
+ * reflects the prior misconfiguration.
  */
 function loadAuditKey(): Buffer | null {
 	if (_cachedKey) return _cachedKey;
@@ -124,14 +144,23 @@ function loadAuditKey(): Buffer | null {
 	try {
 		if (existsSync(keyPath)) {
 			const raw = readFileSync(keyPath);
-			// Only cache if it looks like a usable key (non-empty).
-			if (raw && raw.length > 0) {
+			// Accept the key only if it meets the minimum length. A short
+			// key (e.g. an operator hand-wrote 4 bytes) is rejected and
+			// falls through to the regeneration path below — defense in
+			// depth for the documented "32 random bytes" contract.
+			if (raw && raw.length >= AUDIT_KEY_BYTES) {
 				_cachedKey = raw;
 				return _cachedKey;
 			}
+			if (raw && raw.length > 0) {
+				console.error(
+					`[pi-secured-setup] audit key too short (${raw.length} bytes); regenerating a secure ${AUDIT_KEY_BYTES}-byte key.`,
+				);
+			}
 		}
-		// Generate a new 32-byte key.
-		const key = randomBytes(32);
+		// Generate a new AUDIT_KEY_BYTES-byte key (first run, missing
+		// file, empty file, or rejected-too-short file).
+		const key = randomBytes(AUDIT_KEY_BYTES);
 		mkdirSync(dirname(keyPath), { recursive: true });
 		writeFileSync(keyPath, key, { mode: 0o600 });
 		ensureKeyFileMode(keyPath);

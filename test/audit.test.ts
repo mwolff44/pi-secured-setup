@@ -137,6 +137,89 @@ describe("audit HMAC key management (ADR-0007)", () => {
 
 		assert.deepEqual(keyAfter, keyBefore, "audit.key must not be regenerated if it exists");
 	});
+
+	it("regenerates audit.key when it is shorter than 32 bytes (R8)", () => {
+		const keyPath = resolve(tempDir, "audit.key");
+		// Pre-seed a too-short key (4 bytes) — simulates an operator
+		// hand-writing a weak key.
+		const shortKey = Buffer.from([1, 2, 3, 4]);
+		writeFileSync(keyPath, shortKey, { mode: 0o600 });
+		assert.equal(statSync(keyPath).size, 4, "pre-seed sanity check");
+
+		const errSpy = mock.method(console, "error");
+		try {
+			auditLog("test.shortkey", "info", { check: true });
+		} finally {
+			errSpy.mock.restore();
+		}
+
+		// Key file must now be 32 bytes and differ from the short key.
+		const regenerated = readFileSync(keyPath);
+		assert.equal(regenerated.length, 32, "regenerated key must be 32 bytes");
+		assert.ok(!regenerated.equals(shortKey), "key must differ from the short key");
+
+		// The overwrite path must keep 0o600 perms on POSIX.
+		if (process.platform !== "win32") {
+			const mode = statSync(keyPath).mode & 0o777;
+			assert.equal(mode, 0o600, `regenerated key must keep 0o600, got 0${mode.toString(8)}`);
+		}
+
+		// A warning must have been logged for the short key.
+		const warned = errSpy.mock.calls.some((c) => {
+			const arg = c.arguments[0];
+			return typeof arg === "string" && /audit key too short/i.test(arg);
+		});
+		assert.ok(warned, "must log a 'too short' warning before regenerating");
+	});
+
+	it("accepts a pre-existing audit.key of exactly 32 bytes (no regeneration)", () => {
+		const keyPath = resolve(tempDir, "audit.key");
+		// Pre-seed a valid 32-byte key.
+		const validKey = Buffer.alloc(32, 0xab);
+		writeFileSync(keyPath, validKey, { mode: 0o600 });
+
+		const errSpy = mock.method(console, "error");
+		try {
+			auditLog("test.exact32", "info", { check: true });
+		} finally {
+			errSpy.mock.restore();
+		}
+
+		const after = readFileSync(keyPath);
+		assert.equal(after.length, 32, "key must remain 32 bytes");
+		assert.ok(after.equals(validKey), "key must be byte-for-byte unchanged");
+
+		// No short-key warning for a key that meets the threshold.
+		const warned = errSpy.mock.calls.some((c) => {
+			const arg = c.arguments[0];
+			return typeof arg === "string" && /audit key too short/i.test(arg);
+		});
+		assert.equal(warned, false, "must NOT warn for a valid-length key");
+	});
+
+	it("accepts a pre-existing audit.key longer than 32 bytes (threshold is >=)", () => {
+		const keyPath = resolve(tempDir, "audit.key");
+		// Pre-seed a 64-byte key — exceeds the minimum, must be accepted.
+		const longKey = Buffer.alloc(64, 0xcd);
+		writeFileSync(keyPath, longKey, { mode: 0o600 });
+
+		const errSpy = mock.method(console, "error");
+		try {
+			auditLog("test.long64", "info", { check: true });
+		} finally {
+			errSpy.mock.restore();
+		}
+
+		const after = readFileSync(keyPath);
+		assert.equal(after.length, 64, "key must remain 64 bytes (meets minimum)");
+		assert.ok(after.equals(longKey), "key must be byte-for-byte unchanged");
+
+		const warned = errSpy.mock.calls.some((c) => {
+			const arg = c.arguments[0];
+			return typeof arg === "string" && /audit key too short/i.test(arg);
+		});
+		assert.equal(warned, false, "must NOT warn for a key that meets the minimum");
+	});
 });
 
 describe("audit chain verification (ADR-0007)", () => {

@@ -12,10 +12,15 @@
 #     errors in lib/guard-pipeline.ts were fixed by tightening
 #     validateToolInput's return type to `{ action: "block"; reason:
 #     string } | null`.
-#   - The audit job is `continue-on-error: true` because transitive
-#     vulnerabilities (e.g. protobufjs, undici) may be present without
-#     an upstream fix available. We surface them in the run log without
-#     blocking pull requests.
+#   - The audit job uses a two-tier policy:
+#       * CRITICAL blocks: `npm audit --audit-level=critical` runs as a
+#         hard gate (no continue-on-error). A critical vulnerability
+#         fails the run.
+#       * HIGH is advisory: `npm audit --audit-level=high` runs with
+#         `continue-on-error: true`. Some transitive highs (e.g.
+#         protobufjs, undici) have no clean upstream fix and are
+#         mitigated via the `overrides` block in package.json; we
+#         surface them in the log without blocking PRs.
 
 name: CI
 
@@ -125,14 +130,15 @@ jobs:
         run: npx tsc --noEmit
 
   audit:
-    name: npm audit (high)
+    name: npm audit (critical blocks, high advisory)
     runs-on: ubuntu-latest
     needs: install
-    # Transitive vulnerabilities may exist without an upstream fix
-    # (e.g. protobufjs DoS). We surface them in the log but do not
-    # block PRs. The `overrides` block in package.json pins known-bad
-    # transitive packages to patched ranges where possible.
-    continue-on-error: true
+    # Two-tier supply-chain gate:
+    #   1. CRITICAL is a hard block — a critical vulnerability fails CI.
+    #   2. HIGH is advisory — some transitive highs (e.g. protobufjs
+    #      DoS, undici) have no clean upstream fix and are pinned to
+    #      patched ranges via the `overrides` block in package.json, so
+    #      we surface them in the run log without blocking PRs.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -146,7 +152,17 @@ jobs:
       - name: Install dependencies (npm ci)
         run: npm ci
 
-      - name: npm audit --audit-level=high
+      # Tier 1 — HARD GATE. No continue-on-error: a critical
+      # vulnerability fails the run. Runs first so we fail fast.
+      - name: npm audit --audit-level=critical (blocking)
+        run: npm audit --audit-level=critical
+
+      # Tier 2 — ADVISORY. Surfaces high-severity findings in the run
+      # log. continue-on-error: true because the `overrides` block in
+      # package.json mitigates known transitive highs that lack a clean
+      # upstream fix; we do not want to block PRs on them.
+      - name: npm audit --audit-level=high (advisory)
+        continue-on-error: true
         run: npm audit --audit-level=high
 
   sbom:
