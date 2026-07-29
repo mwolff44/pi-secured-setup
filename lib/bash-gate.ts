@@ -38,8 +38,17 @@ export interface ExfilFinding {
  * Commands that move data off the local machine. When a command-substitution
  * (`$(...)` / `<file`) is detected inside one of these, we treat it as
  * exfiltration of whatever the substitution reads.
+ *
+ * The list intentionally favours tools whose PURPOSE is data egress. For
+ * tools with both benign and egress subcommands (notably `docker`), we match
+ * only the egress subcommands (`docker push`, `docker save`) to avoid noise
+ * on benign invocations like `docker ps`. Bare commands like `aws`/`gcloud`/
+ * `az`/`kubectl`/`helm` always talk to a remote control plane and are matched
+ * wholesale — the heuristic still requires a paired file read, so a bare
+ * `aws sts get-caller-identity` does NOT fire.
  */
-const EXTERNAL_COMMANDS = /\b(?:curl|wget|ssh|scp|rsync|nc|netcat|dig|nslookup|host)\b/i;
+const EXTERNAL_COMMANDS =
+	/\b(?:curl|wget|ssh|scp|rsync|nc|netcat|dig|nslookup|host|aws|gcloud|az|kubectl|helm|ftp|sftp|lftp|openssl|socat|terraform)\b|docker\s+(?:push|save)\b/i;
 
 /**
  * Query-parameter names that routinely carry exfiltrated payloads. We only
@@ -55,10 +64,27 @@ const BASE64_BLOB_IN_URL = /[?=][A-Za-z0-9+/]{64,}={0,2}(?=[&\s"']|$)/;
 
 /**
  * Command substitution (`$(...)` or `< file`) that reads file contents.
- * `$(cat .env)`, `$(< .env)`, `` `cat ~/.ssh/id_rsa` `` all match.
+ * `$(cat .env)`, `$(< .env)`, `` `cat ~/.ssh/id_rsa` ``, `$(awk ... file)`,
+ * `$(python -c '...' file)` all match.
  */
 const SUBSTITUTION_READING_FILES =
-	/\$\(\s*(?:cat|head|tail|od|hexdump|base64|xxd)\s+/i;
+	/\$\(\s*(?:cat|head|tail|od|hexdump|base64|xxd|awk|sed|perl|python3|python|ruby|tee|dd|tar|zip)\s+/i;
+
+/**
+ * File-reading command followed (anywhere in the same piped segment) by a
+ * path-like token — `/` (absolute path), `~` (home), or a dotfile prefix
+ * (`.env`, `.ssh/...`, `.bashrc`). Used by the pipe-based exfil heuristic.
+ *
+ * `tee` is deliberately EXCLUDED here: in a pipe context `tee` is the sink
+ * (it writes to a file), so `curl ... | tee file` is ingress, not exfil.
+ * (`tee` remains in {@link SUBSTITUTION_READING_FILES} for the vanishingly
+ * rare `$(tee ...)` shape, which is harmless to flag.)
+ *
+ * Path-like-token requirement keeps the heuristic conservative: `cat foo |
+ * grep bar` has no path indicator and does not fire.
+ */
+const FILE_READ_WITH_PATH =
+	/\b(?:cat|head|tail|od|hexdump|base64|xxd|awk|sed|perl|python3|python|ruby|dd|tar|zip)\b[^|]*?(?:\/|~|\.\w)/i;
 
 /**
  * Detect exfiltration indicators in a bash command string.
@@ -69,7 +95,17 @@ const SUBSTITUTION_READING_FILES =
  *
  * False-positive posture: query-param and base64 rules only fire on the
  * specific shapes documented above; benign URLs without those shapes do not
- * produce `exfil` findings.
+ * produce `exfil` findings. The substitution and pipe heuristics only fire on
+ * the COMBINATION of an external egress tool AND a file read, so benign
+ * standalone invocations (`aws sts get-caller-identity`, `docker ps`) do not.
+ *
+ * BEST-EFFORT HEURISTIC — not a boundary. This function only escalates a
+ * verdict to `confirm`; the command-classification layer ({@link
+ * classifyCommand}) is the real gate. It cannot catch every exfil channel (a
+ * custom script like `./exfil.sh .env`, an interpreted one-liner with no
+ * recognisable tool name, an encrypted tunnel, etc.), and that is by design:
+ * the goal is to catch the common, recognisable exfil shapes without flooding
+ * benign dev commands with confirmation prompts.
  */
 export function detectExfiltration(command: string): ExfilFinding[] {
 	const findings: ExfilFinding[] = [];
@@ -102,6 +138,25 @@ export function detectExfiltration(command: string): ExfilFinding[] {
 			findings.push({
 				kind: "exfil",
 				detail: "command substitution reading files feeds external command",
+			});
+		}
+	}
+
+	// Pipe-based exfil: a file-reading command on the LEFT of a pipe feeds an
+	// external egress command on the RIGHT. Direction matters — ingress
+	// (external LEFT, file-write RIGHT, e.g. `curl ... | tee file`) is NOT
+	// flagged, because nothing on the local machine is leaving via the pipe.
+	// A doubled `||` is logical OR, not a pipe, and is masked out first.
+	const hasPipe = command.replace(/\|\|/g, "  ").includes("|");
+	if (hasPipe) {
+		const externalMatch = EXTERNAL_COMMANDS.exec(command);
+		if (
+			externalMatch !== null &&
+			FILE_READ_WITH_PATH.test(command.slice(0, externalMatch.index))
+		) {
+			findings.push({
+				kind: "exfil",
+				detail: "piped file read feeds external command",
 			});
 		}
 	}
