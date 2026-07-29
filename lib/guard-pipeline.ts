@@ -11,7 +11,7 @@
  *   2. Protected paths evaluation (read/write/edit only)
  *   3. Bash command classification (bash only)
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_SECURITY_POLICY, type Config } from "./config.js";
 import type { GuardVerdict } from "./boundary.js";
 import { evaluateBoundary } from "./boundary.js";
@@ -125,10 +125,14 @@ interface PipelineCtx {
 	 * {@link canShowDialog}.
 	 */
 	mode?: PiMode;
-	ui: {
-		notify: (message: string, severity: string) => void;
-		confirm: (title: string, message: string) => Promise<boolean>;
-	};
+	/**
+	 * Subset of the real pi {@link ExtensionUIContext}. Using `Pick`
+	 * rather than mirroring signatures keeps the local interface
+	 * assignable from a real `ExtensionContext` (R6: strict mode +
+	 * strictFunctionTypes require the narrowed `notify` severity union
+	 * to match the upstream type, not a bare `string`).
+	 */
+	ui: Pick<ExtensionUIContext, "notify" | "confirm">;
 }
 
 /**

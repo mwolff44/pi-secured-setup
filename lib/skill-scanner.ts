@@ -10,7 +10,7 @@
  * ADR-0004: Only SKILL.md is hashed. Supporting scripts are covered
  * by the bash Guard.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, chmodSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -23,11 +23,14 @@ import { detectInjection } from "./injection-scanner.js";
 
 export interface SkillScannerContext {
 	hasUI: boolean;
-	ui: {
-		notify(message: string, severity: string): void;
-		confirm(title: string, message: string): Promise<boolean>;
-		select(title: string, options: string[]): Promise<string>;
-	};
+	/**
+	 * Subset of the real pi {@link ExtensionUIContext}. Using `Pick`
+	 * keeps the local interface assignable from a real
+	 * `ExtensionCommandContext` under strict mode / strictFunctionTypes
+	 * (R6: the `notify` severity must be the upstream union, not bare
+	 * `string`, and `select` returns `string | undefined` like upstream).
+	 */
+	ui: Pick<ExtensionUIContext, "notify" | "confirm" | "select">;
 	cwd?: string;
 }
 

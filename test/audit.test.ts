@@ -635,27 +635,31 @@ describe("/security:clean — re-seals HMAC chain (R2)", () => {
 	/**
 	 * Capture and invoke the `/security:clean` command handler. Mirrors
 	 * the mock-pi pattern in metrics-scanner.test.ts.
+	 *
+	 * The handler is captured into an object property rather than a
+	 * `let` variable: TypeScript keeps an object property at its declared
+	 * type (`CleanHandler | undefined`) at read points, so the non-null
+	 * assertion yields a callable function. A `let` captured only inside
+	 * the mock's closure would stay narrowed to its `null` initializer,
+	 * making the assertion collapse to `never` under strict mode (R6).
 	 */
 	async function runClean(days: number): Promise<{ notify: ReturnType<typeof mock.fn> }> {
-		let cleanHandler:
-			| ((args: string | undefined, ctx: unknown) => Promise<void>)
-			| null = null;
+		type CleanCtx = { ui: { notify: (message: string, severity?: "info" | "warning" | "error") => void } };
+		type CleanHandler = (args: string, ctx: CleanCtx) => Promise<void>;
+		const captured: { handler?: CleanHandler } = {};
 		const pi = {
 			on() {},
-			registerCommand(
-				name: string,
-				def: { handler: (args: string | undefined, ctx: unknown) => Promise<void> },
-			) {
-				if (name === "security:clean") cleanHandler = def.handler;
+			registerCommand(name: string, def: { handler: CleanHandler }) {
+				if (name === "security:clean") captured.handler = def.handler;
 			},
-		} as unknown as ExtensionAPI;
+		};
 
 		const { registerAuditCommand } = await import("../lib/audit.js");
-		registerAuditCommand(pi, {} as never);
+		registerAuditCommand(pi as unknown as ExtensionAPI, {} as never);
 
-		assert.ok(cleanHandler, "/security:clean command must be registered");
+		assert.ok(captured.handler, "/security:clean command must be registered");
 		const notify = mock.fn();
-		await cleanHandler!(String(days), { ui: { notify } });
+		await captured.handler!(String(days), { ui: { notify } });
 		return { notify };
 	}
 

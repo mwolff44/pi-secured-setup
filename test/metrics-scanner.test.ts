@@ -701,20 +701,29 @@ describe("/security dashboard renders metrics section (AC#1)", () => {
 		writeFileSync(auditFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
 
 		// Build a mock pi that captures the registered command handler.
-		let dashboardHandler: ((args: string | undefined, ctx: any) => Promise<void>) | null = null;
+		// The handler is captured in an object property so TypeScript keeps
+		// it at its declared type at the read point; a `let` captured only
+		// inside the closure would stay narrowed to `null`, making the
+		// non-null assertion collapse to `never` under strict mode (R6).
+		type DashboardCtx = {
+			hasUI: boolean;
+			ui: { notify: (message: string, severity?: "info" | "warning" | "error") => void };
+		};
+		type DashboardHandler = (args: string | undefined, ctx: DashboardCtx) => Promise<void>;
+		const captured: { handler?: DashboardHandler } = {};
 		const pi = {
 			on() {},
-			registerCommand(name: string, def: { handler: (args: string | undefined, ctx: any) => Promise<void> }) {
-				if (name === "security") dashboardHandler = def.handler;
+			registerCommand(name: string, def: { handler: DashboardHandler }) {
+				if (name === "security") captured.handler = def.handler;
 			},
-		} as unknown as ExtensionAPI;
+		};
 
 		const { registerAuditCommand } = await import("../lib/audit.js");
-		registerAuditCommand(pi, makeConfig());
+		registerAuditCommand(pi as unknown as ExtensionAPI, makeConfig());
 
-		assert.ok(dashboardHandler, "/security command must be registered");
+		assert.ok(captured.handler, "/security command must be registered");
 		const notify = mock.fn();
-		await dashboardHandler!(undefined, { hasUI: true, ui: { notify } });
+		await captured.handler!(undefined, { hasUI: true, ui: { notify } });
 
 		assert.equal(notify.mock.calls.length, 1, "dashboard must notify once");
 		const [message] = notify.mock.calls[0].arguments as [string, string];
