@@ -21,7 +21,7 @@ A file pattern (glob) identifying sensitive files that require elevated permissi
 _Avoid_: Sensitive file, restricted file, blocked file
 
 **Protected baseline**:
-The set of protected-path patterns contributed by the `defaults` and `machine` config layers, which the `project` layer cannot remove. A `!` exclusion in the project layer that targets a baseline pattern is ignored (with a warning). The project layer may only ADD protected patterns (strengthen), never weaken the baseline.
+The set of protected-path patterns contributed by the `defaults` and `machine` config layers, which the `project` layer cannot remove. A `!` exclusion in the project layer that targets a baseline pattern is ignored (with a warning). The project layer may only ADD protected patterns (strengthen), never weaken the baseline. The same lock applies to the scalar `writeAction`/`readAction` fields: ranked `allow` < `confirm` < `block`, the project layer may only make them MORE restrictive, and a weaker value (e.g. `readAction:"allow"` against a baseline `"confirm"`) is ignored with a warning while the baseline value is kept. Machine-layer overrides of defaults are unconstrained — the clamp is project-only.
 _Avoid_: Immutable paths, locked patterns
 
 **Skill approval**:

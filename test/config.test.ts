@@ -168,6 +168,77 @@ describe("mergeProtectedPaths", () => {
 		assert.equal(result.readAction, "block");
 	});
 
+	it("project-layer readAction \"allow\" is clamped to baseline \"confirm\" with a warning (AC#1)", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			undefined,
+			pp([], "block", "allow"),
+		]);
+		assert.equal(result.readAction, "confirm", "project allow must not weaken baseline confirm");
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer readAction "allow" weakens the baseline "confirm"/.test(String(c.arguments[0])),
+			),
+			"must warn that the weakening project readAction was ignored",
+		);
+	});
+
+	it("project-layer writeAction \"confirm\" is clamped to baseline \"block\" with a warning (AC#1)", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			undefined,
+			pp([], "confirm", "confirm"),
+		]);
+		assert.equal(result.writeAction, "block", "project confirm must not weaken baseline block");
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer writeAction "confirm" weakens the baseline "block"/.test(String(c.arguments[0])),
+			),
+			"must warn that the weakening project writeAction was ignored",
+		);
+	});
+
+	it("project-layer readAction \"block\" strengthens baseline \"confirm\" and is honoured with no warning (AC#2)", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			undefined,
+			pp([], "block", "block"),
+		]);
+		assert.equal(result.readAction, "block", "project block strengthens baseline confirm and is honoured");
+		assert.equal(consoleErrorMock.mock.calls.length, 0, "strengthening must not warn");
+	});
+
+	it("project-layer writeAction equal to baseline \"block\" is honoured with no warning (AC#2)", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			undefined,
+			pp([], "block", "confirm"),
+		]);
+		assert.equal(result.writeAction, "block", "equal project value is honoured");
+		assert.equal(consoleErrorMock.mock.calls.length, 0, "equal value must not warn");
+	});
+
+	it("machine-layer readAction \"allow\" overrides default \"confirm\" (clamp is project-only, AC#3)", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			pp([], "block", "allow"),
+			undefined,
+		]);
+		assert.equal(result.readAction, "allow", "machine overrides defaults; the clamp is project-only");
+		assert.equal(consoleErrorMock.mock.calls.length, 0, "machine overrides must not warn");
+	});
+
+	it("no project layer → baseline actions are used with no warning", () => {
+		const result = mergeProtectedPaths([
+			pp([".env"], "block", "confirm"),
+			pp([], "confirm", "block"),
+			undefined,
+		]);
+		assert.equal(result.writeAction, "confirm", "machine writeAction overrides default");
+		assert.equal(result.readAction, "block", "machine readAction overrides default");
+		assert.equal(consoleErrorMock.mock.calls.length, 0, "no project layer means no warning");
+	});
+
 	it("emits a warning when ignoring a project exclusion of a baseline pattern", () => {
 		mergeProtectedPaths([pp([".env"]), undefined, pp(["!.env"])]);
 		assert.ok(

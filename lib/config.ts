@@ -8,8 +8,10 @@
  *
  * Pattern lists are additive. A `!` prefix on a pattern in a later layer
  * excludes the matching inherited pattern from an earlier layer.
- * Non-pattern scalar fields (e.g. writeAction, readAction) in later layers
- * replace earlier values.
+ * Non-pattern scalar fields (e.g. writeAction, readAction) follow a
+ * strengthen-only rule at the project layer: a project value may only be
+ * more restrictive than the defaults+machine baseline. Machine overrides
+ * of defaults are unconstrained (the operator's prerogative). See ADR-0009.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -216,6 +218,44 @@ function rejectBroadProjectPatterns(patterns: string[], category: string): strin
 }
 
 /**
+ * Restrictiveness rank of a protected-path scalar action. Higher = more
+ * restrictive. Used to enforce the immovable-baseline lock on the
+ * `writeAction`/`readAction` scalars (ADR-0009): the project layer may
+ * only make them more restrictive, never weaker.
+ *
+ *   allow   → 0  (least restrictive; readAction only)
+ *   confirm → 1
+ *   block   → 2  (most restrictive)
+ *
+ * Unknown values rank as `confirm` (1) so a malformed project value can
+ * never silently weaken the baseline.
+ */
+function protectedActionRank(action: string | undefined): number {
+	switch (action) {
+		case "allow":
+			return 0;
+		case "confirm":
+			return 1;
+		case "block":
+			return 2;
+		default:
+			return 1; // unknown → treated as confirm
+	}
+}
+
+/**
+ * Return the more restrictive of two protected-path actions. Ties resolve
+ * to the first operand. Undefined operands fall back to `confirm` so the
+ * function is total over its (possibly malformed) input space.
+ */
+function mostRestrictive(
+	a: "block" | "confirm" | "allow" | undefined,
+	b: "block" | "confirm" | "allow" | undefined,
+): "block" | "confirm" | "allow" {
+	return protectedActionRank(a) >= protectedActionRank(b) ? (a ?? "confirm") : (b ?? "confirm");
+}
+
+/**
  * Merge protected-paths config across three layers.
  *
  * The protected-path patterns contributed by the defaults and machine layers
@@ -223,6 +263,13 @@ function rejectBroadProjectPatterns(patterns: string[], category: string): strin
  * remove baseline patterns via `!`: a project-layer exclusion that targets a
  * baseline pattern is ignored with a warning (the baseline pattern stays).
  * Machine-layer exclusions of default patterns are unaffected. See ADR-0009.
+ *
+ * The same immovable-baseline lock applies to the scalar `writeAction` and
+ * `readAction` fields: the project layer may only make them MORE restrictive
+ * (rank order `allow` < `confirm` < `block`). A project-layer value that would
+ * weaken the baseline is ignored with a warning, and the baseline value is
+ * kept. Machine-layer overrides of defaults are unaffected (the operator's
+ * prerogative) — the clamp applies exclusively to the project layer.
  */
 export function mergeProtectedPaths(
 	layers: [ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined],
@@ -250,10 +297,36 @@ export function mergeProtectedPaths(
 		}
 	}
 
+	// Baseline scalar actions come from defaults + machine. Machine overrides
+	// defaults (the operator's prerogative); that interaction is unchanged.
+	const baselineWrite: "block" | "confirm" = machine?.writeAction ?? def?.writeAction ?? "block";
+	const baselineRead: "block" | "confirm" | "allow" = machine?.readAction ?? def?.readAction ?? "confirm";
+
+	// Clamp the project layer to the baseline: the project may only make the
+	// scalar actions MORE restrictive (ADR-0009). A weaker project value is
+	// ignored with a warning, and the baseline is kept.
+	let writeAction: "block" | "confirm" = baselineWrite;
+	if (project?.writeAction !== undefined) {
+		if (protectedActionRank(project.writeAction) < protectedActionRank(baselineWrite)) {
+			console.error(`[pi-secured-setup] WARNING: Project-layer writeAction "${project.writeAction}" weakens the baseline "${baselineWrite}" and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+		} else {
+			writeAction = mostRestrictive(baselineWrite, project.writeAction) as "block" | "confirm";
+		}
+	}
+
+	let readAction: "block" | "confirm" | "allow" = baselineRead;
+	if (project?.readAction !== undefined) {
+		if (protectedActionRank(project.readAction) < protectedActionRank(baselineRead)) {
+			console.error(`[pi-secured-setup] WARNING: Project-layer readAction "${project.readAction}" weakens the baseline "${baselineRead}" and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+		} else {
+			readAction = mostRestrictive(baselineRead, project.readAction);
+		}
+	}
+
 	return {
 		patterns: [...baseline, ...additions],
-		writeAction: project?.writeAction ?? machine?.writeAction ?? def?.writeAction ?? "block",
-		readAction: project?.readAction ?? machine?.readAction ?? def?.readAction ?? "confirm",
+		writeAction,
+		readAction,
 	};
 }
 
