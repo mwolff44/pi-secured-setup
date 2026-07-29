@@ -2,24 +2,26 @@
  * Skill scanner — SKILL.md hash verification + change detection.
  *
  * Scans skill directories on `session_start`, hashes each `SKILL.md`,
- * and compares against stored approvals. New or changed skills trigger
- * an approval prompt. Previously skipped/unapproved skills show a
- * notification only (no blocking prompt).
+ * and compares against stored approvals. New, changed, and previously-skipped
+ * skills trigger an approval prompt (skipped = deferred decision, re-prompted
+ * once per session). Previously denied skills show a notification only
+ * (explicit permanent refusal, no blocking prompt).
  *
  * ADR-0004: Only SKILL.md is hashed. Supporting scripts are covered
  * by the bash Guard.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, chmodSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Config } from "./config.js";
 import { MACHINE_CONFIG_DIR, sha256 } from "./utils.js";
 import { auditLog, setSkillStatusFn } from "./audit.js";
+import { detectInjection } from "./injection-scanner.js";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
-interface SkillScannerContext {
+export interface SkillScannerContext {
 	hasUI: boolean;
 	ui: {
 		notify(message: string, severity: string): void;
@@ -68,9 +70,30 @@ function loadApprovals(): SkillApprovalsDb {
 	}
 }
 
-function saveApprovals(db: SkillApprovalsDb): void {
+export function saveApprovals(db: SkillApprovalsDb): void {
 	mkdirSync(dirname(_approvalsFile), { recursive: true });
-	writeFileSync(_approvalsFile, JSON.stringify(db, null, 2) + "\n", "utf-8");
+	writeFileSync(_approvalsFile, JSON.stringify(db, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+	ensureApprovalsFileMode();
+}
+
+/**
+ * Best-effort: re-chmod the approvals file to 0o600 on POSIX if it already
+ * exists with overly-open permissions. The `mode` option passed to
+ * writeFileSync only applies on file creation — it is ignored when
+ * overwriting an existing file — so this corrects any pre-existing file
+ * that was created with looser perms.
+ */
+function ensureApprovalsFileMode(): void {
+	if (process.platform === "win32") return;
+	if (!existsSync(_approvalsFile)) return;
+	try {
+		const mode = statSync(_approvalsFile).mode & 0o777;
+		if (mode !== 0o600) {
+			chmodSync(_approvalsFile, 0o600);
+		}
+	} catch {
+		// Best-effort: don't crash save if chmod fails.
+	}
 }
 
 /**
@@ -108,7 +131,7 @@ export function migrateNameBasedKeys(db: SkillApprovalsDb, cwd: string): SkillAp
 
 // ── Skill discovery ───────────────────────────────────────────────────
 
-interface DiscoveredSkill {
+export interface DiscoveredSkill {
 	name: string;
 	skillMdPath: string;
 	source: string;
@@ -173,9 +196,9 @@ function discoverAllSkills(cwd: string): DiscoveredSkill[] {
 
 // ── Approval flow ─────────────────────────────────────────────────────
 
-type SkillAlertType = "new" | "changed" | "unapproved";
+export type SkillAlertType = "new" | "changed" | "skipped" | "denied";
 
-interface SkillAlert {
+export interface SkillAlert {
 	skill: DiscoveredSkill;
 	type: SkillAlertType;
 	storedHash?: string;
@@ -184,8 +207,21 @@ interface SkillAlert {
 
 /**
  * Compare discovered skills against the approvals DB and generate alerts.
+ *
+ * Alert semantics:
+ *   - `new`      : no DB entry yet                          → actionable
+ *   - `changed`  : SKILL.md hash differs from stored        → actionable
+ *   - `skipped`  : user deferred the decision (not decided)  → actionable (re-prompt)
+ *   - `denied`   : user explicitly refused (permanent)       → notification only
+ *   - `approved` : hash matches and status is approved       → silent (no alert)
+ *
+ * `skipped` is treated as a deferred decision: the user has not yet made a
+ * choice, so we re-prompt once per session to obtain one. `denied` is an
+ * explicit, permanent refusal — we only surface a notification, never a
+ * blocking prompt. The user may still re-trigger a review of denied skills
+ * on demand via `/security:skills` (which sets `forAll`).
  */
-function generateAlerts(
+export function generateAlerts(
 	skills: DiscoveredSkill[],
 	db: SkillApprovalsDb,
 ): SkillAlert[] {
@@ -213,9 +249,12 @@ function generateAlerts(
 				storedHash: existing.hash,
 				currentHash,
 			});
-		} else if (existing.status !== "approved") {
-			// Previously skipped or denied — notification only
-			alerts.push({ skill, type: "unapproved", currentHash });
+		} else if (existing.status === "skipped") {
+			// Deferred decision — re-prompt each session (actionable)
+			alerts.push({ skill, type: "skipped", currentHash });
+		} else if (existing.status === "denied") {
+			// Explicit permanent refusal — notification only
+			alerts.push({ skill, type: "denied", currentHash });
 		}
 		// else: approved and unchanged — silent
 	}
@@ -224,82 +263,119 @@ function generateAlerts(
 }
 
 // ── Approval flow ─────────────────────────────────────────────────────
-async function runApprovalFlow(
+export async function runApprovalFlow(
 	alerts: SkillAlert[],
 	db: SkillApprovalsDb,
 	ctx: SkillScannerContext,
 	forAll: boolean = false,
 ): Promise<SkillApprovalsDb> {
-	// Separate actionable alerts from notification-only
-	const actionable = alerts.filter((a) => a.type === "new" || a.type === "changed" || forAll);
-	const notificationOnly = alerts.filter((a) => a.type === "unapproved" && !forAll);
+	// Separate actionable alerts (prompt) from notification-only.
+	// `skipped` is actionable (deferred decision → re-prompt each session);
+	// `denied` is notification-only (explicit permanent refusal). `forAll`
+	// (set by `/security:skills`) forces every alert actionable so the user
+	// can re-review even denied skills on demand.
+	const actionable = alerts.filter(
+		(a) => a.type === "new" || a.type === "changed" || a.type === "skipped" || forAll,
+	);
+	const notificationOnly = alerts.filter((a) => a.type === "denied" && !forAll);
 
-	// Show notification for previously unapproved skills (not blocking)
+	// Notify about denied skills without blocking (notification-only)
 	if (notificationOnly.length > 0 && ctx.hasUI) {
 		const names = notificationOnly.map((a) => a.skill.name).join(", ");
 		ctx.ui.notify(
-			`⚠️ ${notificationOnly.length} unapproved skill(s): ${names}. Use /security:skills to review.`,
+			`⚠️ ${notificationOnly.length} denied skill(s): ${names}. Use /security:skills to review.`,
 			"warning",
 		);
 	}
 
-	// Prompt for new/changed skills
+	// Prompt for actionable skills (new / changed / skipped, or any when forAll)
 	for (const alert of actionable) {
+		// Read the FULL SKILL.md content once. Used for both the 30-line
+		// preview AND injection detection. Detecting on the full content
+		// (not just the preview) ensures a payload hidden below line 30
+		// is still surfaced (P0-3).
+		let content: string | null = null;
+		try {
+			content = readFileSync(alert.skill.skillMdPath, "utf-8");
+		} catch {
+			// Leave null — the preview branch emits "(Could not read SKILL.md)".
+		}
+
+		// Aggregate pattern names + counts only — NEVER log or display
+		// verbatim matched text. Parity with the injection scanner's own
+		// audit discipline: logging attacker-controlled content would
+		// amplify the very payload we are defending against (P0-3, ADR-0006).
+		const suspiciousPatterns: Record<string, number> = {};
+		if (content !== null) {
+			for (const { patternName } of detectInjection(content)) {
+				suspiciousPatterns[patternName] = (suspiciousPatterns[patternName] ?? 0) + 1;
+			}
+		}
+		const hasWarnings = Object.keys(suspiciousPatterns).length > 0;
+
 		if (!ctx.hasUI) {
-			// No UI — log but don't block
+			// No UI — log but don't block. Surface suspicious-pattern
+			// counts so the signal is captured non-interactively (P0-3).
 			auditLog(
-				alert.type === "new" ? "skill.new" : alert.type === "changed" ? "skill.changed" : "skill.unapproved",
+				alert.type === "new" ? "skill.new"
+					: alert.type === "changed" ? "skill.changed"
+					: alert.type === "skipped" ? "skill.skipped"
+					: "skill.denied",
 				"warning",
 				{
 					skill: alert.skill.name,
 					path: alert.skill.skillMdPath,
 					status: "pending (no UI)",
+					...(hasWarnings ? { suspiciousPatterns } : {}),
 				},
 			);
 			continue;
 		}
 
-		// Show details
-		let message = `Skill: ${alert.skill.name}\n`;
+		// Build the approval dialog message. The full message is passed as
+		// the select prompt so the reviewer sees the preview + any warnings
+		// before choosing (the pi select API renders its first argument as
+		// the dialog prompt).
+		let message = `🔒 Skill Review: ${alert.skill.name}\n\n`;
+		message += `Skill: ${alert.skill.name}\n`;
 		message += `Source: ${alert.skill.source}\n`;
 		message += `Path: ${alert.skill.skillMdPath}\n\n`;
 
 		if (alert.type === "new") {
 			message += "🆕 New skill detected.\n\n";
-			// Show a preview of SKILL.md content (first 30 lines)
-			try {
-				const content = readFileSync(alert.skill.skillMdPath, "utf-8");
-				const preview = content.split("\n").slice(0, 30).join("\n");
-				message += `--- SKILL.md preview ---\n${preview}\n---`;
-			} catch {
-				message += "(Could not read SKILL.md)";
-			}
 		} else if (alert.type === "changed") {
 			message += "🔄 SKILL.md content has changed.\n\n";
-			// Show a diff
-			try {
-				const newContent = readFileSync(alert.skill.skillMdPath, "utf-8");
-				// We don't have old content stored, so just show new content preview
-				message += `--- SKILL.md (current) ---\n${newContent.split("\n").slice(0, 30).join("\n")}\n---`;
-			} catch {
-				message += "(Could not read SKILL.md)";
-			}
 		} else {
-			// unapproved — forced re-review via /security:skills
-			message += "⚠️ This skill has not been approved.\n";
-			try {
-				const content = readFileSync(alert.skill.skillMdPath, "utf-8");
-				const preview = content.split("\n").slice(0, 30).join("\n");
-				message += `\n--- SKILL.md preview ---\n${preview}\n---`;
-			} catch {
-				message += "(Could not read SKILL.md)";
-			}
+			// `skipped` (deferred decision, re-prompting) or `denied` (only
+			// reachable here under forced re-review via /security:skills,
+			// since denied is otherwise notification-only). The actionable
+			// vs. notification distinction is enforced by the filter above.
+			message += "🔒 This skill requires an approval decision.\n\n";
 		}
 
-		const choice = await ctx.ui.select(
-			`🔒 Skill Review: ${alert.skill.name}`,
-			["Approve", "Deny", "Skip"],
-		);
+		// Surface injection findings as a prominent warning BEFORE the
+		// preview so the reviewer sees the risk before reading the
+		// (potentially manipulative) content. This is a SCANNER — it
+		// augments the prompt only and CANNOT block loading the skill
+		// (ADR-0004 / CONTEXT.md: "a Scanner ... never prevent(s) a tool
+		// from running"). The user remains free to Approve/Deny/Skip.
+		if (hasWarnings) {
+			const summary = Object.entries(suspiciousPatterns)
+				.map(([name, count]) => `${name} (${count})`)
+				.join(", ");
+			message += `⚠️ Suspicious patterns detected in SKILL.md: ${summary}\n`;
+			message += "Review carefully before approving.\n\n";
+		}
+
+		if (content !== null) {
+			const preview = content.split("\n").slice(0, 30).join("\n");
+			const label = alert.type === "changed" ? "SKILL.md (current)" : "SKILL.md preview";
+			message += `--- ${label} ---\n${preview}\n---`;
+		} else {
+			message += "(Could not read SKILL.md)";
+		}
+
+		const choice = await ctx.ui.select(message, ["Approve", "Deny", "Skip"]);
 
 		const now = new Date().toISOString();
 
@@ -448,18 +524,20 @@ export function registerSkillScanner(
 
 		if (alerts.length === 0) return; // All clean
 
-		const actionable = alerts.filter((a) => a.type === "new" || a.type === "changed");
+		const actionable = alerts.filter(
+			(a) => a.type === "new" || a.type === "changed" || a.type === "skipped",
+		);
 
 		if (actionable.length > 0) {
 			const updatedDb = await runApprovalFlow(alerts, db, ctx);
 			saveApprovals(updatedDb);
 		} else {
-			// Only unapproved notifications
-			const notificationOnly = alerts.filter((a) => a.type === "unapproved");
+			// Only denied notifications (notification-only)
+			const notificationOnly = alerts.filter((a) => a.type === "denied");
 			if (notificationOnly.length > 0 && ctx.hasUI) {
 				const names = notificationOnly.map((a) => a.skill.name).join(", ");
 				ctx.ui.notify(
-					`⚠️ ${notificationOnly.length} unapproved skill(s): ${names}. Use /security:skills to review.`,
+					`⚠️ ${notificationOnly.length} denied skill(s): ${names}. Use /security:skills to review.`,
 					"warning",
 				);
 			}
@@ -488,11 +566,15 @@ export async function triggerSkillReview(ctx: SkillScannerContext): Promise<void
 
 		const currentHash = "sha256:" + sha256(content);
 		const existing = db.skills[skill.skillMdPath];
+		// `/security:skills` forces re-review of every skill (forAll=true
+		// below makes them all actionable). The type only drives the prompt
+		// message; it does not gate prompting here.
 		const type: SkillAlertType =
 			!existing ? "new" :
-			existing.status !== "approved" ? "unapproved" :
+			existing.status === "skipped" ? "skipped" :
+			existing.status === "denied" ? "denied" :
 			existing.hash !== currentHash ? "changed" :
-			"unapproved"; // approved but force re-review
+			"skipped"; // approved & unchanged — re-prompt for re-confirmation
 
 		return { skill, type, currentHash } as SkillAlert;
 	}).filter((a): a is SkillAlert => a !== null);

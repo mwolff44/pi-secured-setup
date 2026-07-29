@@ -19,6 +19,7 @@ import {
 	projectConfigDir,
 	expandTilde,
 } from "./utils.js";
+import type { SecurityLimits } from "./rate-limiter.js";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -44,11 +45,66 @@ export interface AuditConfig {
 	maxFiles: number;
 }
 
+/**
+ * A single injection-detection rule. `pattern` is a raw regex string compiled
+ * at runtime (case-insensitive). Invalid patterns are skipped by the scanner.
+ */
+export interface InjectionRule {
+	name: string;
+	pattern: string;
+}
+
+/**
+ * Injection-detection configuration. Machine-only: a project-layer
+ * `injection-rules.json` is ignored (warned) so a checked-in file cannot
+ * weaken detection. See ADR-0006.
+ */
+export interface InjectionRulesConfig {
+	patterns: InjectionRule[];
+	threshold: number;
+}
+
+/**
+ * Rate-limiting policy. Machine-only (see `loadSecurityPolicy`): a
+ * project-layer `security-policy.json` cannot raise limits or disable
+ * rate limiting. Follows the same baseline-strengthening principle as
+ * `audit-config.json` and `injection-rules.json` (ADR-0009).
+ *
+ * The shape is shared with the rate limiter (`SecurityLimits`), which
+ * owns the definition so it has no inbound lib dependencies.
+ */
+export type SecurityPolicy = SecurityLimits;
+
+/**
+ * Shipped default rate-limiting policy. Generous thresholds that avoid
+ * blocking legitimate heavy workflows while still capping runaway loops
+ * (tool_calls), dialog spam (confirmations), and audit flooding
+ * (audit_writes). The three trailing anomaly thresholds are consumed by
+ * the metrics scanner (P2-5); they are populated here so callers reading
+ * `config.securityPolicy` always see them.
+ */
+export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
+	toolCallsPerTurn: 100,
+	confirmationsPerSession: 200,
+	auditWritesPerSecond: 500,
+	tokensPerTurnWarn: 8000,
+	toolCallsPerMinuteWarn: 60,
+	tokensSessionWarn: 50000,
+};
+
 export interface Config {
 	protectedPaths: ProtectedPathsConfig;
 	commandRules: CommandRulesConfig;
 	allowedExternal: AllowedExternalConfig;
 	audit: AuditConfig;
+	injection: InjectionRulesConfig;
+	/**
+	 * Rate-limiting policy (machine-only). Optional so existing test
+	 * fixtures that build a `Config` literal do not break; runtime config
+	 * from `loadConfig` always sets this. Code that consumes it must fall
+	 * back to `DEFAULT_SECURITY_POLICY` when absent.
+	 */
+	securityPolicy?: SecurityPolicy;
 	cwd: string;
 }
 
@@ -122,27 +178,94 @@ export function mergePatterns(layers: (string[] | undefined)[]): string[] {
 }
 
 /**
- * Merge protected-paths config across three layers.
+ * Command patterns contributed by the project layer that match every command.
+ * Such patterns would classify all commands as `safe`/`moderate` and disarm the
+ * bash gate. They are rejected (dropped) when coming from the project layer so
+ * the affected commands fall back to `unknown` → confirm. See ADR-0009.
  */
-function mergeProtectedPaths(
+const OVERLY_BROAD_COMMAND_PATTERNS: ReadonlySet<string> = new Set([".*", "^.*$", "^"]);
+
+/**
+ * Case-insensitive membership check, matching the case-insensitive `!`
+ * exclusion semantics in `mergePatterns`.
+ */
+function containsIgnoreCase(patterns: string[], target: string): boolean {
+	const lower = target.toLowerCase();
+	return patterns.some((p) => p.toLowerCase() === lower);
+}
+
+/**
+ * Drop overly-broad `safe`/`moderate` patterns contributed by the project
+ * layer. Exclusions (prefixed with `!`) are passed through unchanged so the
+ * project layer's non-baseline exclusion semantics are preserved. See ADR-0009.
+ */
+function rejectBroadProjectPatterns(patterns: string[], category: string): string[] {
+	const kept: string[] = [];
+	for (const p of patterns) {
+		if (p.startsWith("!")) {
+			kept.push(p);
+			continue;
+		}
+		if (OVERLY_BROAD_COMMAND_PATTERNS.has(p)) {
+			console.error(`[pi-secured-setup] WARNING: Overly broad ${category} command pattern "${p}" from the project layer was rejected (would classify all commands as ${category}). The pattern falls back to unknown→confirm.`);
+			continue;
+		}
+		kept.push(p);
+	}
+	return kept;
+}
+
+/**
+ * Merge protected-paths config across three layers.
+ *
+ * The protected-path patterns contributed by the defaults and machine layers
+ * form an immovable baseline. The project layer may add new patterns but cannot
+ * remove baseline patterns via `!`: a project-layer exclusion that targets a
+ * baseline pattern is ignored with a warning (the baseline pattern stays).
+ * Machine-layer exclusions of default patterns are unaffected. See ADR-0009.
+ */
+export function mergeProtectedPaths(
 	layers: [ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined],
 ): ProtectedPathsConfig {
 	const [def, machine, project] = layers;
 
-	const result: ProtectedPathsConfig = {
-		patterns: mergePatterns([def?.patterns, machine?.patterns, project?.patterns]),
+	// Baseline = defaults + machine. Machine exclusions of defaults are honoured.
+	const baseline = mergePatterns([def?.patterns, machine?.patterns]);
+
+	// Apply the project layer, enforcing the immovable-baseline lock.
+	const additions: string[] = [];
+	if (project?.patterns) {
+		for (const p of project.patterns) {
+			if (p.startsWith("!")) {
+				const target = p.slice(1);
+				// The project layer cannot remove baseline patterns.
+				if (containsIgnoreCase(baseline, target)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer protected-path exclusion "${p}" targets a baseline pattern and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+				}
+				// else: excluding a non-existent pattern is a silent no-op,
+				// matching mergePatterns' behaviour.
+				continue;
+			}
+			additions.push(p);
+		}
+	}
+
+	return {
+		patterns: [...baseline, ...additions],
 		writeAction: project?.writeAction ?? machine?.writeAction ?? def?.writeAction ?? "block",
 		readAction: project?.readAction ?? machine?.readAction ?? def?.readAction ?? "confirm",
 	};
-
-	return result;
 }
 
 /**
  * Merge command-rules config across three layers.
  * Each category is merged independently.
+ *
+ * Overly-broad `safe`/`moderate` patterns contributed by the project layer are
+ * rejected (dropped) so affected commands fall back to `unknown` → confirm.
+ * Defaults and machine layers are unaffected. See ADR-0009.
  */
-function mergeCommandRules(
+export function mergeCommandRules(
 	layers: [CommandRulesConfig | undefined, CommandRulesConfig | undefined, CommandRulesConfig | undefined],
 ): CommandRulesConfig {
 	const [def, machine, project] = layers;
@@ -151,7 +274,11 @@ function mergeCommandRules(
 	const result = {} as CommandRulesConfig;
 
 	for (const cat of categories) {
-		result[cat] = mergePatterns([def?.[cat], machine?.[cat], project?.[cat]]);
+		let projectCat = project?.[cat];
+		if (projectCat && (cat === "safe" || cat === "moderate")) {
+			projectCat = rejectBroadProjectPatterns(projectCat, cat);
+		}
+		result[cat] = mergePatterns([def?.[cat], machine?.[cat], projectCat]);
 	}
 
 	return result;
@@ -185,6 +312,8 @@ export function ensureMachineConfigDir(): void {
 		"command-rules.json",
 		"allowed-external.json",
 		"audit-config.json",
+		"injection-rules.json",
+		"security-policy.json",
 	];
 
 	for (const file of files) {
@@ -198,6 +327,29 @@ export function ensureMachineConfigDir(): void {
 }
 
 // ── Public API ────────────────────────────────────────────────────────
+
+/**
+ * Load the rate-limiting policy. Machine-only: a project-layer
+ * `security-policy.json` cannot raise limits or disable rate limiting,
+ * so a checked-in file is ignored with a warning. This follows the same
+ * baseline-strengthening principle as `audit-config.json` and
+ * `injection-rules.json` (ADR-0009): the project layer may strengthen
+ * security but never weaken it.
+ *
+ * Resolution order: machine layer → shipped defaults → hard-coded
+ * `DEFAULT_SECURITY_POLICY` fallback.
+ */
+export function loadSecurityPolicy(cwd: string): SecurityPolicy {
+	const projectPath = resolve(projectConfigDir(cwd), "security-policy.json");
+	if (existsSync(projectPath)) {
+		console.error("[pi-secured-setup] WARNING: A project-layer security-policy.json was detected at .pi/security/security-policy.json and will be IGNORED. Rate-limiting policy is machine-only and cannot be configured by the project layer. A checked-in file cannot raise limits or disable rate limiting (see ADR-0009).");
+	}
+	return (
+		readJsonFile<SecurityPolicy>(resolve(MACHINE_CONFIG_DIR, "security-policy.json")) ??
+		readJsonFile<SecurityPolicy>(resolve(DEFAULTS_DIR, "security-policy.json")) ??
+		DEFAULT_SECURITY_POLICY
+	);
+}
 
 /**
  * Load and merge configuration from all three layers.
@@ -217,11 +369,31 @@ export function loadConfig(cwd: string): Config {
 		readJsonFile<AuditConfig>(resolve(DEFAULTS_DIR, "audit-config.json")) ??
 		{ maxFileSize: 10 * 1024 * 1024, maxFiles: 3 };
 
+	// Injection rules are machine-only (ADR-0006). The project layer is
+	// ignored entirely — a checked-in `.pi/security/injection-rules.json`
+	// cannot weaken or disable detection. A detected project-layer file is
+	// warned about so operators know their file had no effect.
+	const projectInjectionPath = resolve(projectConfigDir(cwd), "injection-rules.json");
+	if (existsSync(projectInjectionPath)) {
+		console.error("[pi-secured-setup] WARNING: A project-layer injection-rules.json was detected at .pi/security/injection-rules.json and will be IGNORED. Injection detection rules are machine-only and cannot be configured by the project layer (see ADR-0006).");
+	}
+	const injectionRules: InjectionRulesConfig =
+		readJsonFile<InjectionRulesConfig>(resolve(MACHINE_CONFIG_DIR, "injection-rules.json")) ??
+		readJsonFile<InjectionRulesConfig>(resolve(DEFAULTS_DIR, "injection-rules.json")) ??
+		{ patterns: [], threshold: 3 };
+
+	// Rate-limiting policy is machine-only (same principle as audit-config
+	// and injection-rules, ADR-0009): a checked-in `.pi/security/
+	// security-policy.json` cannot raise limits or disable rate limiting.
+	const securityPolicy = loadSecurityPolicy(cwd);
+
 	const result: Config = {
 		protectedPaths: mergeProtectedPaths(protectedPathsLayers),
 		commandRules: mergeCommandRules(commandRulesLayers),
 		allowedExternal: mergeAllowedExternal(allowedExternalLayers),
 		audit: auditConfig,
+		injection: injectionRules,
+		securityPolicy,
 		cwd,
 	};
 

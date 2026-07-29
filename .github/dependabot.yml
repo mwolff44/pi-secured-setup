@@ -1,0 +1,38 @@
+# Dependabot configuration for pi-secured-setup.
+#
+# Two ecosystems are watched:
+#   1. npm       — production and dev dependencies (root of the repo).
+#   2. github-actions — pinned action versions in .github/workflows/*.
+#
+# Both check weekly (Monday) and open pull requests for updates. The npm
+# ecosystem groups minor and patch updates into a single PR to avoid
+# noise; major bumps still get individual PRs.
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      # Roll up minor/patch updates for dev-only tooling.
+      dev-tools:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore(deps)
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(ci)
+      include: scope

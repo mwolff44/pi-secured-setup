@@ -1,3 +1,5 @@
 node_modules/
-package-lock.json
 .weave/
+coverage/
+.nyc_output/
+bom.json

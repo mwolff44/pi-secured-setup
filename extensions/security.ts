@@ -12,7 +12,10 @@ import { evaluateBoundary } from "../lib/boundary.js";
 import { evaluateProtectedPaths } from "../lib/protected-paths.js";
 import { classifyCommand } from "../lib/bash-gate.js";
 import { registerSecretScanner } from "../lib/secret-scanner.js";
+import { registerInjectionScanner } from "../lib/injection-scanner.js";
+import { registerMetricsScanner } from "../lib/metrics-scanner.js";
 import { registerSkillScanner, triggerSkillReview } from "../lib/skill-scanner.js";
+import { resetSession, resetTurn } from "../lib/rate-limiter.js";
 
 export default function (pi: ExtensionAPI) {
 	// Initialise session-scoped audit
@@ -37,12 +40,20 @@ export default function (pi: ExtensionAPI) {
 
 	// Scanners (observe, don't block)
 	registerSecretScanner(pi, () => config);
+	registerInjectionScanner(pi, () => config);
+	registerMetricsScanner(pi, () => config);
 	registerSkillScanner(pi, () => config);
 
 	// Record session start and reload config with correct cwd
 	pi.on("session_start", async (_event, ctx) => {
 		// Reload config in case cwd changed (resume, fork, etc.)
 		config = loadConfig(ctx.cwd);
+
+		// Reset rate-limiter counters for the new session: confirmations
+		// are scoped per session, and defensively reset the per-turn
+		// tool-call counter too (turn_start also resets it per turn).
+		resetSession();
+		resetTurn();
 
 		auditLog("session.loaded", "info", {
 			cwd: ctx.cwd,

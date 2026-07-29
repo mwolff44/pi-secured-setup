@@ -17,6 +17,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
 		commandRules: { safe: [], moderate: [], dangerous: [], external: [] },
 		allowedExternal: { paths: [] },
 		audit: { maxFileSize: 10_000_000, maxFiles: 3 },
+		injection: { patterns: [], threshold: 3 },
 		...overrides,
 	};
 }
