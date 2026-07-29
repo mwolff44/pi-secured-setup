@@ -210,6 +210,47 @@ function computeEntryHash(entry: AuditEntry, key: Buffer, prevHash: string): str
 }
 
 /**
+ * Rebuild a brand-new forward chain over `entries` from GENESIS.
+ *
+ * Each entry keeps its body fields (`timestamp`, `sessionId`, `type`,
+ * `severity`, `details`, plus any extras) verbatim, but receives a
+ * fresh `seq` (1..n), `prevHash` (`{@link GENESIS_HASH}` for the first
+ * entry, the prior entry's new `hash` otherwise), and `hash` computed
+ * via {@link computeEntryHash}. Stale `seq`/`prevHash`/`hash` are
+ * dropped and replaced.
+ *
+ * Used by `/security:clean` to re-seal the chain after trimming old
+ * entries so `/security:verify` stays green. Only the key-holder can
+ * produce a valid re-seal — an attacker who deletes entries without
+ * the key cannot forge a passing chain, so verify still detects real
+ * tampering. This mirrors the synthetic-hashing loop inside
+ * {@link computeChainStateAndMigrate} but writes back fresh chain
+ * fields rather than synthesising them only to emit an
+ * `audit.migrate` record.
+ *
+ * Exported so tests can build valid chains from arbitrary timestamps.
+ */
+export function rechainEntries(entries: AuditEntry[], key: Buffer): AuditEntry[] {
+	let prevHash = GENESIS_HASH;
+	let seq = 0;
+	const out: AuditEntry[] = [];
+	for (const entry of entries) {
+		seq++;
+		// Clone non-chain fields verbatim, drop stale seq/prevHash/hash.
+		const rebuilt: AuditEntry = { ...entry } as AuditEntry;
+		delete (rebuilt as Partial<AuditEntry>).seq;
+		delete (rebuilt as Partial<AuditEntry>).prevHash;
+		delete (rebuilt as Partial<AuditEntry>).hash;
+		rebuilt.seq = seq;
+		rebuilt.prevHash = prevHash;
+		rebuilt.hash = computeEntryHash(rebuilt, key, prevHash);
+		prevHash = rebuilt.hash;
+		out.push(rebuilt);
+	}
+	return out;
+}
+
+/**
  * Read all entries from the current audit file. Returns [] on missing
  * or unreadable file. Malformed lines are skipped.
  */
@@ -909,7 +950,13 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 	});
 
 	pi.registerCommand("security:clean", {
-		description: "Trim audit log (remove entries older than N days)",
+		description:
+			"Trim audit log (remove entries older than N days). " +
+			"Re-seals the HMAC forward chain over the kept entries from " +
+			"GENESIS so /security:verify stays green after a user-initiated " +
+			"trim. Only the key-holder can re-seal; an attacker deleting " +
+			"entries without audit.key cannot forge a valid chain, so " +
+			"verify still detects real tampering.",
 		handler: async (args, ctx) => {
 			const days = parseInt(args || "30", 10);
 			if (isNaN(days) || days <= 0) {
@@ -931,25 +978,79 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 
 			const lines = content.split("\n");
 			let removed = 0;
-			const kept: string[] = [];
+			const keptEntries: AuditEntry[] = [];
+			const keptRaw: string[] = []; // byte-for-byte original lines (fallback path)
+			const keptMalformed: string[] = []; // unparseable lines, preserved as-is
 
 			for (const line of lines) {
 				try {
 					const entry = JSON.parse(line) as AuditEntry;
 					if (entry.timestamp >= cutoff) {
-						kept.push(line);
+						keptEntries.push(entry);
+						keptRaw.push(line);
 					} else {
 						removed++;
 					}
 				} catch {
-					kept.push(line); // keep malformed lines
+					keptMalformed.push(line); // keep malformed lines
 				}
 			}
 
-			writeFileSync(_auditFile, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
+			// NO-OP when nothing changed: preserve the original file
+			// (and its original hashes) verbatim. No audit.clean event
+			// is emitted, no rewrite, no re-chain. Avoids spurious
+			// rewrites that would invalidate the existing chain.
+			if (removed === 0) {
+				ctx.ui.notify(
+					`Audit log: nothing to clean (0 entries older than ${days} days).`,
+					"info",
+				);
+				return;
+			}
 
-			auditLog("audit.clean", "info", { removed, remaining: kept.length, olderThan: cutoff });
-			ctx.ui.notify(`Cleaned audit log: removed ${removed} entries older than ${days} days.`, "info");
+			const key = loadAuditKey();
+			if (key) {
+				// Re-seal the chain over kept entries from GENESIS so
+				// /security:verify stays green. Only the key-holder can
+				// produce a valid chain.
+				const rechained = rechainEntries(keptEntries, key);
+				const outLines = [
+					...rechained.map((e) => JSON.stringify(e)),
+					...keptMalformed,
+				];
+				writeFileSync(
+					_auditFile,
+					outLines.length > 0 ? outLines.join("\n") + "\n" : "",
+					"utf-8",
+				);
+			} else {
+				// No key available — cannot re-seal. Fall back to writing
+				// the kept entries verbatim (preserving their stale chain
+				// fields). /security:verify will report the chain as
+				// broken, which is honest: without the key we cannot
+				// produce a valid forward chain and cannot distinguish
+				// this trim from attacker deletion.
+				const outLines = [...keptRaw, ...keptMalformed];
+				writeFileSync(
+					_auditFile,
+					outLines.length > 0 ? outLines.join("\n") + "\n" : "",
+					"utf-8",
+				);
+			}
+
+			// Append audit.clean via auditLog. computeChainStateAndMigrate
+			// will detect the already-rechained kept entries (they have
+			// hash/seq/prevHash) and just resume — no double-migrate.
+			auditLog("audit.clean", "info", {
+				removed,
+				remaining: keptEntries.length,
+				olderThan: cutoff,
+				resealed: key !== null,
+			});
+			ctx.ui.notify(
+				`Cleaned audit log: removed ${removed} entries older than ${days} days.`,
+				"info",
+			);
 		},
 	});
 

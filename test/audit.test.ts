@@ -7,7 +7,7 @@
  * derived from the audit file's directory, so the key is isolated
  * to the same temp directory automatically.
  */
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, rmSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { resolve } from "node:path";
@@ -18,8 +18,10 @@ import {
 	_setAuditFileForTest,
 	_setRotationConfigForTest,
 	verifyAuditChain,
+	rechainEntries,
 } from "../lib/audit.js";
 import type { AuditEntry, FileVerification } from "../lib/audit.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 describe("audit severity types", () => {
 	it("AuditSeverity accepts only valid values", () => {
@@ -555,6 +557,328 @@ describe("audit rotation (maybeRotate) — multi-file + overflow + audit.roll se
 		auditLog("test.small", "info", { ok: true });
 		assert.ok(!existsSync(`${auditFile}.1`), "no rotation should occur under the threshold");
 		assert.ok(existsSync(auditFile), "current file should still exist");
+	});
+});
+
+// ── /security:clean — re-seal the HMAC chain (R2 follow-up) ───────────
+//
+// `/security:clean <days>` trims entries older than N days. The trim
+// removes entries from the middle of the chain, so without re-sealing
+// the surviving entries' prevHash links point to deleted predecessors
+// and `/security:verify` reports "chain broken" — indistinguishable
+// from attacker deletion. The fix re-seals the chain over the kept
+// entries from GENESIS using the local audit.key, so a user-initiated
+// trim verifies OK while an attacker deletion (no key) still breaks.
+//
+// These tests drive the command via a mocked `pi.registerCommand`
+// (same pattern as metrics-scanner.test.ts). The key path derives
+// from the audit file's directory, so `_setAuditFileForTest` isolates
+// the key to the temp dir.
+
+describe("/security:clean — re-seals HMAC chain (R2)", () => {
+	let tempDir: string;
+	let auditFile: string;
+	let keyPath: string;
+	let previousAuditFile: string;
+
+	beforeEach(() => {
+		tempDir = resolve(
+			tmpdir(),
+			`pi-audit-clean-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(tempDir, { recursive: true });
+		auditFile = resolve(tempDir, "audit.jsonl");
+		keyPath = resolve(tempDir, "audit.key");
+		previousAuditFile = _setAuditFileForTest(auditFile);
+		initAuditLog();
+	});
+
+	afterEach(() => {
+		_setAuditFileForTest(previousAuditFile);
+		if (tempDir && existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	/** Read the audit.key from the temp dir as a Buffer. */
+	function loadKey(): Buffer {
+		assert.ok(existsSync(keyPath), "audit.key must exist; call auditLog() first to generate it");
+		return readFileSync(keyPath);
+	}
+
+	/**
+	 * Build a fully-chained audit file from a list of entries with
+	 * arbitrary timestamps. Useful for seeding backdated entries that
+	 * `auditLog` (which always stamps `new Date()`) cannot produce.
+	 */
+	function seedChainedEntries(entries: AuditEntry[]): void {
+		const key = loadKey();
+		const chained = rechainEntries(entries, key);
+		writeFileSync(
+			auditFile,
+			chained.map((e) => JSON.stringify(e)).join("\n") + "\n",
+			"utf-8",
+		);
+	}
+
+	/** Build a single AuditEntry with the given timestamp + index. */
+	function entryAt(timestamp: string, idx: number): AuditEntry {
+		return {
+			timestamp,
+			sessionId: "seed-session",
+			type: "test.event",
+			severity: "info",
+			details: { idx },
+		};
+	}
+
+	/**
+	 * Capture and invoke the `/security:clean` command handler. Mirrors
+	 * the mock-pi pattern in metrics-scanner.test.ts.
+	 */
+	async function runClean(days: number): Promise<{ notify: ReturnType<typeof mock.fn> }> {
+		let cleanHandler:
+			| ((args: string | undefined, ctx: unknown) => Promise<void>)
+			| null = null;
+		const pi = {
+			on() {},
+			registerCommand(
+				name: string,
+				def: { handler: (args: string | undefined, ctx: unknown) => Promise<void> },
+			) {
+				if (name === "security:clean") cleanHandler = def.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		const { registerAuditCommand } = await import("../lib/audit.js");
+		registerAuditCommand(pi, {} as never);
+
+		assert.ok(cleanHandler, "/security:clean command must be registered");
+		const notify = mock.fn();
+		await cleanHandler!(String(days), { ui: { notify } });
+		return { notify };
+	}
+
+	it("after clean removes entries, verifyAuditChain returns OK", async () => {
+		// First call generates the audit.key.
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		// Seed a mix of old + new chained entries across a date range.
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		const seeded: AuditEntry[] = [
+			entryAt(new Date(now - 60 * dayMs).toISOString(), 0), // 60d ago → removed
+			entryAt(new Date(now - 50 * dayMs).toISOString(), 1), // 50d ago → removed
+			entryAt(new Date(now - 5 * dayMs).toISOString(), 2), // 5d ago → kept
+			entryAt(new Date(now - 1 * dayMs).toISOString(), 3), // 1d ago → kept
+			entryAt(new Date(now).toISOString(), 4), // now → kept
+		];
+		seedChainedEntries(seeded);
+
+		// Sanity: the seeded chain verifies before clean.
+		let before = verifyAuditChain();
+		assert.equal(before.length, 1);
+		assert.equal(before[0].ok, true, `seeded chain should verify: ${before[0].reason}`);
+
+		// Clean with a 30-day cutoff: removes the two oldest entries.
+		await runClean(30);
+
+		// After clean, verify must still return OK.
+		const after = verifyAuditChain();
+		assert.equal(after.length, 1, "only the current file should exist");
+		assert.equal(
+			after[0].ok,
+			true,
+			`chain should verify after clean: ${after[0].reason}`,
+		);
+		// 3 kept entries + 1 audit.clean = 4.
+		assert.equal(after[0].entries, 4);
+	});
+
+	it("kept entries form a valid forward chain (seq from 1, prevHash links)", async () => {
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		seedChainedEntries([
+			entryAt(new Date(now - 60 * dayMs).toISOString(), 0), // removed
+			entryAt(new Date(now - 1 * dayMs).toISOString(), 1), // kept
+			entryAt(new Date(now).toISOString(), 2), // kept
+		]);
+
+		await runClean(30);
+
+		const lines = readFileSync(auditFile, "utf-8").trim().split("\n");
+		const entries = lines.map((l) => JSON.parse(l) as AuditEntry);
+
+		// First entry is the first KEPT entry, re-chained from GENESIS.
+		assert.equal(entries[0].seq, 1, "first kept entry must have seq=1");
+		assert.equal(entries[0].prevHash, "GENESIS", "first kept entry prevHash = GENESIS");
+
+		// Walk the chain: each entry's prevHash == prior entry's hash,
+		// and seq is monotonic from 1.
+		for (let i = 1; i < entries.length; i++) {
+			assert.equal(
+				entries[i].seq,
+				entries[i - 1].seq! + 1,
+				`seq must be monotonic at index ${i}`,
+			);
+			assert.equal(
+				entries[i].prevHash,
+				entries[i - 1].hash,
+				`prevHash at index ${i} must reference prior entry's hash`,
+			);
+		}
+
+		// The last entry is the audit.clean event (appended via auditLog).
+		assert.equal(entries[entries.length - 1].type, "audit.clean");
+	});
+
+	it("audit.clean event is appended and chains correctly onto the re-sealed entries", async () => {
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		seedChainedEntries([
+			entryAt(new Date(now - 60 * dayMs).toISOString(), 0), // removed
+			entryAt(new Date(now - 1 * dayMs).toISOString(), 1), // kept
+		]);
+
+		await runClean(30);
+
+		const lines = readFileSync(auditFile, "utf-8").trim().split("\n");
+		const entries = lines.map((l) => JSON.parse(l) as AuditEntry);
+
+		// Last entry is audit.clean.
+		const clean = entries[entries.length - 1];
+		assert.equal(clean.type, "audit.clean");
+		assert.equal(typeof clean.hash, "string", "audit.clean must be chained (hash)");
+		assert.equal(typeof clean.seq, "number", "audit.clean must be chained (seq)");
+		assert.equal(typeof clean.prevHash, "string", "audit.clean must be chained (prevHash)");
+
+		// Its prevHash must reference the last re-sealed kept entry's hash.
+		const lastKept = entries[entries.length - 2];
+		assert.equal(
+			clean.prevHash,
+			lastKept.hash,
+			"audit.clean prevHash must chain off the last kept entry",
+		);
+		assert.equal(clean.seq, lastKept.seq! + 1, "audit.clean seq must follow last kept entry");
+
+		// Details must record the trim.
+		assert.equal(clean.details.removed, 1);
+		assert.equal(clean.details.remaining, 1);
+		assert.equal(clean.details.resealed, true);
+	});
+
+	it("attacker middle-deletion (no re-seal) still breaks the chain (regression guard)", async () => {
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		// All entries within the kept window so clean would no-op —
+		// this isolates the attacker-deletion scenario from clean.
+		seedChainedEntries([
+			entryAt(new Date(now - 5 * dayMs).toISOString(), 0),
+			entryAt(new Date(now - 4 * dayMs).toISOString(), 1),
+			entryAt(new Date(now - 3 * dayMs).toISOString(), 2),
+			entryAt(new Date(now - 2 * dayMs).toISOString(), 3),
+			entryAt(new Date(now - 1 * dayMs).toISOString(), 4),
+		]);
+
+		// Before tampering: verifies OK.
+		let results = verifyAuditChain();
+		assert.equal(results[0].ok, true, "seeded chain must verify before tampering");
+
+		// ATTACKER SIMULATION: read the file, delete a MIDDLE line,
+		// write it back WITHOUT re-sealing. No key needed for deletion.
+		const content = readFileSync(auditFile, "utf-8").trim();
+		const lines = content.split("\n");
+		assert.equal(lines.length, 5);
+		lines.splice(2, 1); // remove index 2 (the middle entry, seq=3)
+		writeFileSync(auditFile, lines.join("\n") + "\n", "utf-8");
+
+		// Verify MUST report broken. This proves the re-seal during
+		// clean does NOT mask real tampering — only the key-holder can
+		// produce a valid chain after a deletion.
+		results = verifyAuditChain();
+		assert.equal(results.length, 1);
+		const r = results[0];
+		assert.equal(r.ok, false, "attacker deletion must break the chain");
+		assert.ok(r.brokenAtSeq !== undefined, "brokenAtSeq must be reported");
+		// seq=4 was the entry after the deleted seq=3; its prevHash still
+		// points to the (now-deleted) seq=3's hash.
+		assert.equal(r.brokenAtSeq, 4, `chain should break at seq 4, got ${r.brokenAtSeq}`);
+	});
+
+	it("removed === 0 is a NO-OP — original hashes preserved, file unchanged", async () => {
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		// All entries within a 5-day window; clean with 30-day cutoff
+		// removes nothing.
+		seedChainedEntries([
+			entryAt(new Date(now - 5 * dayMs).toISOString(), 0),
+			entryAt(new Date(now - 3 * dayMs).toISOString(), 1),
+			entryAt(new Date(now - 1 * dayMs).toISOString(), 2),
+		]);
+
+		// Snapshot the exact file bytes before clean.
+		const before = readFileSync(auditFile, "utf-8");
+
+		const { notify } = await runClean(30);
+
+		// File must be byte-for-byte unchanged.
+		const after = readFileSync(auditFile, "utf-8");
+		assert.equal(after, before, "no-op clean must not rewrite the file");
+
+		// No audit.clean event was emitted.
+		assert.equal(
+			after.includes('"audit.clean"'),
+			false,
+			"no-op clean must not append audit.clean",
+		);
+
+		// Verify still OK.
+		const results = verifyAuditChain();
+		assert.equal(results[0].ok, true, `verify must still pass: ${results[0].reason}`);
+		assert.equal(results[0].entries, 3, "all 3 entries preserved");
+
+		// User was still notified.
+		assert.equal(notify.mock.calls.length, 1);
+		const [msg] = notify.mock.calls[0].arguments as [string, string];
+		assert.match(msg, /nothing to clean/i);
+	});
+
+	it("all entries removed → file contains only audit.clean chained from GENESIS", async () => {
+		auditLog("test.bootstrap", "info", { ok: true });
+
+		const now = Date.now();
+		const dayMs = 24 * 60 * 60 * 1000;
+		// All entries very old → all removed by a 30-day cutoff.
+		seedChainedEntries([
+			entryAt(new Date(now - 100 * dayMs).toISOString(), 0),
+			entryAt(new Date(now - 90 * dayMs).toISOString(), 1),
+			entryAt(new Date(now - 80 * dayMs).toISOString(), 2),
+		]);
+
+		await runClean(30);
+
+		// After clean: only audit.clean remains, chained from GENESIS.
+		const lines = readFileSync(auditFile, "utf-8").trim().split("\n");
+		assert.equal(lines.length, 1, "only audit.clean should remain");
+		const only = JSON.parse(lines[0]) as AuditEntry;
+		assert.equal(only.type, "audit.clean");
+		assert.equal(only.seq, 1, "audit.clean must be seq=1 (fresh chain from GENESIS)");
+		assert.equal(only.prevHash, "GENESIS", "audit.clean prevHash = GENESIS");
+		assert.equal(typeof only.hash, "string");
+
+		// Verify OK.
+		const results = verifyAuditChain();
+		assert.equal(results.length, 1);
+		assert.equal(results[0].ok, true, `verify must pass: ${results[0].reason}`);
+		assert.equal(results[0].entries, 1);
 	});
 });
 
