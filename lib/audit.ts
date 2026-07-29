@@ -793,25 +793,70 @@ function verifyFile(file: string, key: Buffer | null): FileVerification {
 }
 
 /**
+ * Defensive upper bound on rotated-file-number scanning. Legitimately
+ * there are never more than `maxFiles` (default 3) rotated files; this
+ * cap prevents unbounded scanning if the filesystem were somehow
+ * populated with adversarial `.N` suffixes.
+ */
+const MAX_ROTATION_SCAN = 99;
+
+/**
  * Replay the chain over the current file and all rotated files (`.N` … `.1`,
  * oldest first). Returns one `FileVerification` per file in oldest-first
  * order. Used by the `/security:verify` command and by tests.
+ *
+ * Rotation-sequence gap detection (R9 follow-up): the scan walks every
+ * file number from 1 up to the highest present number (capped at
+ * {@link MAX_ROTATION_SCAN}) instead of stopping at the first missing
+ * one. A retained middle file deleted by a keyless attacker (e.g. `.2`
+ * removed while `.1` and `.3` remain) would otherwise halt the scan at
+ * `.2` and silently ignore `.3`, leaving the deletion undetected. Each
+ * missing number strictly below the highest present file is now reported
+ * as a `FileVerification` gap finding (`ok:false`) so silent deletion of
+ * a whole retained file is surfaced. Files beyond the highest present
+ * number are absent due to age-out past `maxFiles` or because rotation
+ * has not reached them yet — those are NOT flagged.
+ *
+ * Each rotated file remains independently chain-verified from GENESIS
+ * (per ADR-0007); cross-file crypto binding is an accepted residual
+ * risk bounded by key custody (see ADR-0007 Consequences).
  */
 export function verifyAuditChain(): FileVerification[] {
 	const key = loadAuditKey();
 	const results: FileVerification[] = [];
 
-	// Discover rotated files and order oldest-first (.N → .1).
-	let maxN = 0;
-	for (let i = 1; ; i++) {
+	// Discover ALL rotated files present, up to a defensive cap. We do
+	// NOT stop at the first missing file: a keyless attacker who
+	// deletes a retained middle file (e.g. `.2` while `.1` and `.3`
+	// exist) would otherwise cause the scan to halt at `.2` and `.3`
+	// would be silently ignored — the deletion undetected.
+	const present = new Set<number>();
+	let maxPresent = 0;
+	for (let i = 1; i <= MAX_ROTATION_SCAN; i++) {
 		if (existsSync(`${_auditFile}.${i}`)) {
-			maxN = i;
-		} else {
-			break;
+			present.add(i);
+			if (i > maxPresent) maxPresent = i;
 		}
 	}
-	for (let i = maxN; i >= 1; i--) {
-		results.push(verifyFile(`${_auditFile}.${i}`, key));
+
+	// Emit verifications oldest-first (maxPresent → 1), inserting gap
+	// findings for any missing file number strictly below maxPresent.
+	// A gap means a retained middle file is absent — the per-file chain
+	// still catches content tampering, but silent deletion of a whole
+	// retained file would otherwise be missed. Files above maxPresent
+	// are intentionally absent (age-out / not-yet-rotated) and are NOT
+	// flagged.
+	for (let i = maxPresent; i >= 1; i--) {
+		if (present.has(i)) {
+			results.push(verifyFile(`${_auditFile}.${i}`, key));
+		} else {
+			results.push({
+				file: `${_auditFile}.${i}`,
+				ok: false,
+				entries: 0,
+				reason: "rotated file missing — gap in rotation sequence (possible deletion)",
+			});
+		}
 	}
 	if (existsSync(_auditFile)) {
 		results.push(verifyFile(_auditFile, key));
@@ -839,13 +884,15 @@ function formatVerifyReport(results: FileVerification[]): string {
 		if (r.ok) {
 			lines.push(`  ✅ ${label}: ${r.entries} entries, chain intact`);
 		} else {
-			const at =
-				r.brokenAtSeq !== undefined
-					? `seq ${r.brokenAtSeq}`
-					: r.brokenAtIndex !== undefined
-						? `line ${r.brokenAtIndex}`
-						: "unknown";
-			lines.push(`  ❌ ${label}: broken at ${at} — ${r.reason}`);
+			if (r.brokenAtSeq !== undefined) {
+				lines.push(`  ❌ ${label}: broken at seq ${r.brokenAtSeq} — ${r.reason}`);
+			} else if (r.brokenAtIndex !== undefined) {
+				lines.push(`  ❌ ${label}: broken at line ${r.brokenAtIndex} — ${r.reason}`);
+			} else {
+				// No seq/index applies (e.g. a rotation-sequence gap
+				// finding for a missing retained file — R9 follow-up).
+				lines.push(`  ❌ ${label}: ${r.reason}`);
+			}
 		}
 	}
 	return lines.join("\n");

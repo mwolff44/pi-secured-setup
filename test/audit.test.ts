@@ -9,7 +9,7 @@
  */
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, rmSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -472,6 +472,212 @@ describe("audit chain verification (ADR-0007)", () => {
 		assert.equal(e2.seq, 2);
 		assert.equal(e2.prevHash, e1.hash, "second entry prevHash should reference first hash");
 		assert.ok(typeof e2.hash === "string" && e2.hash.length === 64);
+	});
+});
+
+// ── Rotation-sequence gap detection (R9 follow-up) ───────────────────
+//
+// `verifyAuditChain` discovers rotated files by scanning `.1`, `.2`, ...
+// and now walks EVERY file number up to the highest present one (capped
+// at 99) instead of stopping at the first missing file. A retained
+// middle file deleted by a keyless attacker (e.g. `.2` removed while
+// `.1` and `.3` remain) would otherwise halt the scan at `.2` and
+// silently ignore `.3`, leaving the deletion undetected. Each missing
+// number strictly below the highest present file is reported as a gap
+// finding. Each rotated file remains independently chain-verified from
+// GENESIS (ADR-0007); cross-file crypto binding is an accepted residual
+// risk bounded by key custody.
+
+describe("audit rotation-sequence gap detection (R9)", () => {
+	let tempDir: string;
+	let auditFile: string;
+	let keyPath: string;
+	let previousAuditFile: string;
+
+	beforeEach(() => {
+		tempDir = resolve(tmpdir(), `pi-audit-gap-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		auditFile = resolve(tempDir, "audit.jsonl");
+		keyPath = resolve(tempDir, "audit.key");
+		previousAuditFile = _setAuditFileForTest(auditFile);
+		initAuditLog();
+	});
+
+	afterEach(() => {
+		_setAuditFileForTest(previousAuditFile);
+		if (tempDir && existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	/** Trigger audit.key generation by writing one real chained entry. */
+	function ensureKey(): void {
+		auditLog("test.bootstrap", "info", { ok: true });
+		assert.ok(existsSync(keyPath), "audit.key must exist after bootstrap");
+	}
+
+	/** Read the audit.key from the temp dir as a Buffer. */
+	function loadKey(): Buffer {
+		assert.ok(existsSync(keyPath), "audit.key must exist; call ensureKey() first");
+		return readFileSync(keyPath);
+	}
+
+	/**
+	 * Write a valid independently-chained rotated file at
+	 * `${auditFile}.${n}` (each file chains from GENESIS per ADR-0007),
+	 * sealed with an `audit.roll` entry at the end so it is
+	 * self-contained and verifiable.
+	 */
+	function seedRotated(n: number, bodies: AuditEntry[]): void {
+		const key = loadKey();
+		const withRoll: AuditEntry[] = [
+			...bodies,
+			{
+				timestamp: new Date().toISOString(),
+				sessionId: "seed-session",
+				type: "audit.roll",
+				severity: "info",
+				details: { reason: "size-threshold" },
+			},
+		];
+		const chained = rechainEntries(withRoll, key);
+		writeFileSync(
+			`${auditFile}.${n}`,
+			chained.map((e) => JSON.stringify(e)).join("\n") + "\n",
+			"utf-8",
+		);
+	}
+
+	/** A minimal body entry for seeding rotated files. */
+	function body(idx: number): AuditEntry {
+		return {
+			timestamp: new Date().toISOString(),
+			sessionId: "seed-session",
+			type: "test.event",
+			severity: "info",
+			details: { idx },
+		};
+	}
+
+	it("detects a gap when a middle rotated file is deleted (R9)", () => {
+		ensureKey();
+		seedRotated(1, [body(1), body(2)]);
+		seedRotated(2, [body(3), body(4)]);
+		seedRotated(3, [body(5), body(6)]);
+
+		// Sanity: contiguous set verifies cleanly before deletion.
+		const before = verifyAuditChain();
+		assert.ok(
+			before.every((r) => r.ok),
+			`seeded contiguous set must verify before deletion: ${JSON.stringify(before)}`,
+		);
+
+		// ATTACKER SIMULATION: delete the middle rotated file (.2)
+		// without the key. A keyless attacker can delete files but
+		// cannot forge a valid HMAC chain.
+		unlinkSync(`${auditFile}.2`);
+		assert.ok(!existsSync(`${auditFile}.2`), ".2 must be deleted");
+
+		const results = verifyAuditChain();
+
+		// The gap for .2 must be reported with ok:false and a reason
+		// mentioning the missing file / deletion.
+		const gap = results.find((r) => r.file === `${auditFile}.2`);
+		assert.ok(gap, "result must include a finding for the deleted .2");
+		assert.equal(gap!.ok, false, "gap finding must be ok:false");
+		assert.equal(gap!.entries, 0, "gap finding has no entries");
+		assert.match(
+			gap!.reason ?? "",
+			/missing|gap|deletion/i,
+			`reason must mention the missing/deletion: ${gap!.reason}`,
+		);
+
+		// The overall report must NOT be all-ok when a gap is present.
+		assert.ok(
+			results.some((r) => !r.ok),
+			"a gap finding must surface as a non-ok result",
+		);
+	});
+
+	it("does NOT silently ignore `.3` when `.2` is missing (R9)", () => {
+		ensureKey();
+		seedRotated(1, [body(1)]);
+		seedRotated(2, [body(2)]);
+		seedRotated(3, [body(3)]);
+
+		// Delete .2 — previously the scan stopped at the first missing
+		// file (.2) and .3 was silently dropped from the result set.
+		unlinkSync(`${auditFile}.2`);
+
+		const results = verifyAuditChain();
+
+		// .3 MUST now appear in the result set (no longer ignored) and
+		// verify OK.
+		const dot3 = results.find((r) => r.file === `${auditFile}.3`);
+		assert.ok(dot3, ".3 must NOT be silently ignored when .2 is missing");
+		assert.equal(dot3!.ok, true, `.3 should verify OK: ${dot3!.reason}`);
+		assert.ok(dot3!.entries > 0, ".3 should contain its sealed entries");
+
+		// AND a gap finding for .2 must be present.
+		const gap = results.find((r) => r.file === `${auditFile}.2`);
+		assert.ok(gap, "gap finding for .2 must be reported");
+		assert.equal(gap!.ok, false);
+
+		// .1 must still verify.
+		const dot1 = results.find((r) => r.file === `${auditFile}.1`);
+		assert.ok(dot1, ".1 must be verified");
+		assert.equal(dot1!.ok, true, `.1 should verify OK: ${dot1!.reason}`);
+
+		// Ordering: oldest-first → .3, .2-gap, .1, current.
+		const files = results.map((r) => r.file);
+		assert.deepEqual(
+			files,
+			[`${auditFile}.3`, `${auditFile}.2`, `${auditFile}.1`, auditFile],
+			"oldest-first order with the .2 gap between .3 and .1",
+		);
+	});
+
+	it("contiguous rotation (`.1`, `.2`, `.3`) reports no gap", () => {
+		ensureKey();
+		seedRotated(1, [body(1), body(2)]);
+		seedRotated(2, [body(3), body(4)]);
+		seedRotated(3, [body(5), body(6)]);
+
+		const results = verifyAuditChain();
+
+		assert.ok(
+			results.every((r) => r.ok),
+			`contiguous set must verify with no gaps: ${JSON.stringify(results, null, 2)}`,
+		);
+		// No gap finding: every rotated entry corresponds to an
+		// existing file (a gap finding has ok:false AND entries === 0).
+		const gaps = results.filter((r) => !r.ok && r.entries === 0);
+		assert.equal(gaps.length, 0, "no gap finding expected for a contiguous set");
+		// All three rotated files plus the current file, oldest-first.
+		assert.equal(results.length, 4, "expected .3, .2, .1, current");
+		assert.equal(results[0].file, `${auditFile}.3`);
+		assert.equal(results[3].file, auditFile);
+	});
+
+	it("partial fill (only `.1`) reports no spurious gap", () => {
+		ensureKey();
+		seedRotated(1, [body(1), body(2)]);
+		// No .2 / .3 — rotation has not reached them yet.
+
+		const results = verifyAuditChain();
+
+		// maxPresent == 1 → nothing higher present → no gap.
+		assert.ok(
+			results.every((r) => r.ok),
+			`partial fill must not produce a spurious gap: ${JSON.stringify(results, null, 2)}`,
+		);
+		const gaps = results.filter((r) => !r.ok && r.entries === 0);
+		assert.equal(gaps.length, 0, "no gap finding expected when only .1 is present");
+
+		// Expect .1 + current (oldest-first).
+		assert.equal(results.length, 2);
+		assert.equal(results[0].file, `${auditFile}.1`);
+		assert.equal(results[1].file, auditFile);
 	});
 });
 
