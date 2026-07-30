@@ -7,6 +7,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "strict": true,
+    "noUnusedLocals": true,
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,

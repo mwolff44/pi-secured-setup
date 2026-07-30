@@ -14,7 +14,7 @@ import { classifyCommand } from "../lib/bash-gate.js";
 import { registerSecretScanner } from "../lib/secret-scanner.js";
 import { registerInjectionScanner } from "../lib/injection-scanner.js";
 import { registerMetricsScanner } from "../lib/metrics-scanner.js";
-import { registerSkillScanner, triggerSkillReview } from "../lib/skill-scanner.js";
+import { registerSkillScanner } from "../lib/skill-scanner.js";
 import { resetSession, resetTurn } from "../lib/rate-limiter.js";
 
 export default function (pi: ExtensionAPI) {

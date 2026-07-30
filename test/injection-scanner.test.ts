@@ -20,16 +20,11 @@ import {
 	walkAndMark,
 	setInjectionRules,
 	registerInjectionScanner,
-	type InjectionFinding,
 } from "../lib/injection-scanner.js";
 import { initAuditLog, _setAuditFileForTest } from "../lib/audit.js";
 import type { AuditEntry } from "../lib/audit.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────
-
-function patternsOf(findings: InjectionFinding[]): string[] {
-	return findings.map((f) => f.patternName).sort();
-}
 
 /**
  * Minimal Config carrying the JSON defaults (empty `patterns` means the

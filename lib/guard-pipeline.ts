@@ -136,12 +136,6 @@ interface PipelineCtx {
 }
 
 /**
- * Backward-compatible alias kept for any external callers; new code
- * should use {@link PipelineCtx}.
- */
-type NotifyCtx = PipelineCtx;
-
-/**
  * The set of pi run modes. Mirrors the unexported `ExtensionMode` from
  * `@earendil-works/pi-coding-agent` (not part of the package's public
  * type surface). Only `"tui"` can render blocking interactive dialogs
