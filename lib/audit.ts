@@ -59,7 +59,35 @@ export function _setAuditFileForTest(path: string): string {
 	const prev = _auditFile;
 	_auditFile = path;
 	_cachedKey = null; // invalidate; key path is derived from _auditFile
+	_chainCache = null; // invalidate; cached state was for the previous file
 	return prev;
+}
+
+// ── Chain-state cache (L2) ────────────────────────────────────────────
+//
+// `computeChainStateAndMigrate` previously re-read the entire audit file on
+// every `auditLog` to recover (prevHash, last seq). After the first write in
+// a file the chain state is known, so we cache it and elide the read on
+// subsequent writes. The cache is keyed by `_auditFile` and validated by the
+// file size: a write outside this module (e.g. `/security:clean` re-sealing,
+// or a test renaming the file) changes the size, invalidating the cache so
+// we re-read and recover the correct state. The cache is also invalidated
+// explicitly on rotation (`maybeRotate` replaces the file) and on
+// `_setAuditFileForTest` (tests point the logger at a new temp file).
+
+let _chainCache: { file: string; prevHash: string; seq: number; size: number } | null = null;
+
+/**
+ * Test-only counter: increments each time `computeChainStateAndMigrate`
+ * performs a full-file read (cache miss). Lets the L2 perf test assert the
+ * 2nd write in a file does NOT re-read it, without depending on fs mocking.
+ */
+let _chainStateReadsForTest = 0;
+export function _getChainStateReadsForTest(): number {
+	return _chainStateReadsForTest;
+}
+export function _resetChainStateReadsForTest(): void {
+	_chainStateReadsForTest = 0;
 }
 
 /**
@@ -317,6 +345,23 @@ function computeChainStateAndMigrate(key: Buffer | null): {
 	prevHash: string;
 	seq: number;
 } {
+	// L2: cache hit — elide the full-file read on repeat writes to the same
+	// file. The cache holds the chain state + post-write size of the last
+	// appended entry. Validate with a cheap stat: if the file size matches,
+	// nothing outside this module has rewritten it, so the next entry resumes
+	// from (cache.prevHash, cache.seq) without reading. A size mismatch (or a
+	// missing/unstatable file) invalidates the cache so we re-read.
+	if (_chainCache && _chainCache.file === _auditFile) {
+		try {
+			if (statSync(_auditFile).size === _chainCache.size) {
+				return { prevHash: _chainCache.prevHash, seq: _chainCache.seq };
+			}
+		} catch {
+			// file missing/unstatable → stale cache
+		}
+		_chainCache = null;
+	}
+	_chainStateReadsForTest++; // L2: ticks once per full-file read in this path
 	const entries = readAllEntries(_auditFile);
 	if (entries.length === 0) return { prevHash: GENESIS_HASH, seq: 0 };
 
@@ -411,6 +456,23 @@ function appendChained(
 		entry.hash = computeEntryHash(entry, key, state.prevHash);
 	}
 	appendFileSync(_auditFile, JSON.stringify(entry) + "\n", "utf-8");
+	// L2: cache the just-written entry's chain state so the next write to
+	// the same file resumes without re-reading. Only cache when the entry
+	// is actually chained (key present); an unchained entry has no usable
+	// prevHash, so we leave the cache unset and the next call re-reads.
+	// Track the post-write file size to detect external rewrites.
+	if (typeof entry.hash === "string") {
+		try {
+			_chainCache = {
+				file: _auditFile,
+				prevHash: entry.hash,
+				seq: state.seq + 1,
+				size: statSync(_auditFile).size,
+			};
+		} catch {
+			_chainCache = null;
+		}
+	}
 }
 
 /**
@@ -521,6 +583,12 @@ function maybeRotate(): void {
 
 	// Ensure new empty log file exists with correct permissions
 	ensureLogExists();
+
+	// L2: the file at `_auditFile` is now a fresh empty chain (the rolled
+	// content moved to `.1`). The cached chain state — if any — described
+	// the rolled content and is stale; invalidate so the next write re-reads
+	// the empty file and resumes from GENESIS.
+	_chainCache = null;
 
 	// Remove files beyond maxFiles (cleanup of any leftover overflow files)
 	for (let i = config.maxFiles + 1; ; i++) {

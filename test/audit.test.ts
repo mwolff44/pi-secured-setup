@@ -19,6 +19,8 @@ import {
 	_setRotationConfigForTest,
 	verifyAuditChain,
 	rechainEntries,
+	_getChainStateReadsForTest,
+	_resetChainStateReadsForTest,
 } from "../lib/audit.js";
 import type { AuditEntry, FileVerification } from "../lib/audit.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -833,6 +835,105 @@ describe("audit active-file truncation/deletion detection (H1)", () => {
 		const current = results.find((r) => r.file === auditFile);
 		assert.ok(current, "current file must appear in the result");
 		assert.equal(current!.ok, true, "empty current file with no rotated files must verify OK");
+	});
+});
+
+// ── L2: cache chain state between writes ───────────────────────────────
+//
+// `auditLog` → `appendChained` → `computeChainStateAndMigrate` previously
+// re-read the ENTIRE audit file on every single write to recover the chain
+// state (prevHash + last seq), making each auditLog O(n) over total entries.
+// After the first write in a file the chain state is known and can be cached;
+// only rotation or a test override invalidates it. This test uses a test-only
+// counter (`_getChainStateReadsForTest`) that ticks once per full-file read
+// in the chain-state path and asserts the 2nd write does NOT read the file.
+
+describe("audit chain-state cache — O(n) read elided on repeat writes (L2)", () => {
+	let tempDir: string;
+	let auditFile: string;
+	let previousAuditFile: string;
+
+	beforeEach(() => {
+		tempDir = resolve(tmpdir(), `pi-audit-l2-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		auditFile = resolve(tempDir, "audit.jsonl");
+		previousAuditFile = _setAuditFileForTest(auditFile);
+		initAuditLog();
+		_resetChainStateReadsForTest();
+	});
+
+	afterEach(() => {
+		_setAuditFileForTest(previousAuditFile);
+		if (tempDir && existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("2nd auditLog does NOT re-read the audit file (chain state cached) (L2 T12)", () => {
+		// First write: bootstraps the key and must read the file once to
+		// recover/seed the chain state.
+		auditLog("test.first", "info", { n: 1 });
+		const firstReads = _getChainStateReadsForTest();
+		assert.ok(
+			firstReads >= 1,
+			`precondition: the 1st auditLog must read the file to seed the chain state (got ${firstReads})`,
+		);
+
+		// Reset and perform the 2nd write. The cache should make this a no-read.
+		_resetChainStateReadsForTest();
+		auditLog("test.second", "info", { n: 2 });
+		assert.equal(
+			_getChainStateReadsForTest(),
+			0,
+			"2nd auditLog must NOT re-read the audit file (chain state cached)",
+		);
+
+		// Sanity: both entries are present and the chain is intact (the cache
+		// did not corrupt the prevHash/seq recovery).
+		const content = readFileSync(auditFile, "utf-8").trim();
+		const lines = content.split("\n");
+		assert.equal(lines.length, 2, "both entries must be written");
+		const e1 = JSON.parse(lines[0]) as AuditEntry;
+		const e2 = JSON.parse(lines[1]) as AuditEntry;
+		assert.equal(e1.seq, 1);
+		assert.equal(e2.seq, 2);
+		assert.equal(e2.prevHash, e1.hash, "chain link must be correct (cache did not corrupt state)");
+	});
+
+	it("3rd auditLog also hits the cache (steady state) (L2 T12b)", () => {
+		auditLog("test.first", "info", { n: 1 });
+		auditLog("test.second", "info", { n: 2 });
+
+		_resetChainStateReadsForTest();
+		auditLog("test.third", "info", { n: 3 });
+		assert.equal(
+			_getChainStateReadsForTest(),
+			0,
+			"3rd auditLog must also hit the cache in steady state",
+		);
+	});
+
+	it("cache is invalidated on rotation — first write to a fresh file re-reads (L2 T12c)", () => {
+		// Force tiny rotation so the file rolls after a few writes.
+		const prevRot = _setRotationConfigForTest({ maxFileSize: 1, maxFiles: 3 });
+		try {
+			// Enough writes to rotate at least once.
+			for (let i = 0; i < 6; i++) {
+				auditLog("test.rot", "info", { i, pad: "x".repeat(50) });
+			}
+			assert.ok(existsSync(`${auditFile}.1`), "precondition: a rotation occurred");
+		} finally {
+			_setRotationConfigForTest(prevRot);
+		}
+
+		// After rotation the current file is a fresh empty chain; the cache
+		// was invalidated, so the next write MUST read the (empty) file once.
+		_resetChainStateReadsForTest();
+		auditLog("test.postrot", "info", { ok: true });
+		assert.ok(
+			_getChainStateReadsForTest() >= 1,
+			`first write after rotation must re-read the file (cache invalidated), got ${_getChainStateReadsForTest()}`,
+		);
 	});
 });
 
