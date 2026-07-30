@@ -185,15 +185,58 @@ function redactLineContent(line: string): { result: string; redactions: Redactio
 }
 
 /**
+ * Detect (without redacting) which secret patterns match inside a string.
+ * Reuses the same `SECRET_PATTERNS` table as `redactString` so detection
+ * stays consistent with redaction. Comment lines are not skipped here —
+ * callers scanning command strings want every match.
+ *
+ * Returns one entry per pattern that matched at least once (deduplicated
+ * by pattern name). Use this from the bash gate to detect secret-bearing
+ * commands without duplicating the pattern list.
+ */
+export function findSecrets(text: string): { patternName: string }[] {
+	const found = new Set<string>();
+
+	// PEM blocks first (treat the whole block as a single private-key hit)
+	const pemRegex = new RegExp(PEM_BLOCK_REGEX.source, PEM_BLOCK_REGEX.flags);
+	if (pemRegex.test(text)) {
+		found.add("private-key");
+	}
+
+	for (const { name, pattern } of SECRET_PATTERNS) {
+		// Skip the multi-line private-key pattern — handled above via PEM_BLOCK_REGEX
+		if (name === "private-key") continue;
+
+		const regex = new RegExp(pattern.source, pattern.flags);
+		let match: RegExpExecArray | null;
+		while ((match = regex.exec(text)) !== null) {
+			const matched = match[0];
+			if (!isPlaceholder(matched)) {
+				found.add(name);
+				// One hit per pattern is enough for detection purposes
+				break;
+			}
+			if (match.index === regex.lastIndex) regex.lastIndex++;
+		}
+	}
+
+	return Array.from(found).map((patternName) => ({ patternName }));
+}
+
+/**
  * Scan and redact secrets from a string value.
  * First redacts multi-line PEM private key blocks as a whole,
  * then processes remaining content line-by-line.
- * Only individual comment lines are skipped; non-comment lines
- * have secrets redacted normally.
+ *
+ * Comment lines are scanned by default (M1): commented-out credentials
+ * (`# API_KEY=sk-ant-...`, `// password=hunter2`) are common in config
+ * files the agent reads and must not reach the LLM in plaintext. Pass
+ * `{ skipCommentLines: true }` to restore the legacy display-only skip
+ * (used by callers that want to preserve comment content verbatim).
  * Returns the redacted string and a list of redactions performed.
  */
 export function redactString(value: string, options: RedactOptions = {}): { result: string; redactions: Redaction[] } {
-	const skipComments = options.skipCommentLines !== false;
+	const skipComments = options.skipCommentLines === true;
 
 	// Step 1: Redact multi-line PEM blocks before line-by-line processing
 	const { result: pemRedacted, redactions: pemRedactions } = redactPEMBlocks(value);

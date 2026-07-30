@@ -1,0 +1,18 @@
+# 0008 Output validation scope
+
+OWASP LLM Practice #5 (Output Validation & Guardrails) was previously unaddressed by the extension. The extension does not own the agent's final user-facing response — pi-agent renders the TUI/CLI output, not this extension — so "output validation" must be scoped to the seams the extension can actually intercept: tool inputs at `tool_call` and bash command content at `tool_call` / `before_provider_request`. Response-body rewriting is outside the extension's responsibility boundary and is deferred indefinitely by design, not by oversight. This ADR records that scope boundary.
+
+## Considered options
+
+- **Validate tool inputs (schema) + detect exfiltration in bash commands + rate-limit tool calls (chosen):** Everything in this option is interceptable at the `tool_call` / `before_provider_request` seams the extension already owns. It is delivered by three implemented mechanisms: input-shape validation via `validateToolInput` in `lib/guard-pipeline.ts` (P2-4), which fail-closes on malformed/missing required fields before any Guard logic runs; bash content inspection via `detectExfiltration` in `lib/bash-gate.ts` (P1-2), which flags command substitution and redirection patterns that would smuggle secrets/exfil payloads and escalates the command's classification; and rate limiting via `rate-limiter.ts` (P2-3), which bounds tool-call frequency against runaway/abusive loops. All three produce audit events. None of them touch the rendered response.
+
+- **Full response rewriting before display:** Rewrite or redact the model's final user-facing response before pi renders it. Rejected because the extension does not render the response — pi-agent owns the TUI/CLI rendering surface — and there is no event seam that exposes the final, about-to-be-displayed text to the extension. Building one would mean owning a rendering surface the extension is explicitly not responsible for, duplicating pi-agent's concern.
+
+- **Schema validation of arbitrary tool result shapes:** Validate the structure of tool results (`read`/`write`/`edit`/`bash` output) against expected shapes before they enter context. Rejected for the same reason ADR-0002 rejected message-structure parsing and tool overrides: tool-result internal shapes (`ReadToolDetails`, `BashToolDetails`, etc.) are not a versioned API and change across pi versions, so shape validation is fragile and breaks silently on pi updates. The extension already observes tool-result *content* via the provider-agnostic string walk (ADR-0002 secret scan, ADR-0006 injection scan); re-checking *shape* adds churn risk without adding coverage.
+
+## Consequences
+
+- "Output validation" for this extension is scoped to exactly three interceptable concerns: (a) tool-input shape validation (`validateToolInput`, `lib/guard-pipeline.ts`), (b) bash command content inspection for secrets and exfiltration (`detectExfiltration`, `lib/bash-gate.ts`), and (c) tool-call rate limiting (`rate-limiter.ts`).
+- Response content rewriting is deferred indefinitely. This is a deliberate, documented scope boundary rooted in the extension's responsibility boundary (it does not own rendering), not a gap to be filled later. A future seam is not anticipated.
+- The rejection of tool-result shape validation inherits ADR-0002's provider-agnostic, version-resilient stance: the extension validates *inputs* it controls and observes *content* via string walks, but never asserts on internal result shapes it does not own.
+- No new event seam is introduced; all three chosen mechanisms hang off the existing `tool_call` (P2-4, P2-3) and `before_provider_request` (P1-2's audit path) handlers, consistent with ADR-0001's single-combined-handler discipline.

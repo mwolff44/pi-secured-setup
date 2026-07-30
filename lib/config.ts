@@ -8,8 +8,10 @@
  *
  * Pattern lists are additive. A `!` prefix on a pattern in a later layer
  * excludes the matching inherited pattern from an earlier layer.
- * Non-pattern scalar fields (e.g. writeAction, readAction) in later layers
- * replace earlier values.
+ * Non-pattern scalar fields (e.g. writeAction, readAction) follow a
+ * strengthen-only rule at the project layer: a project value may only be
+ * more restrictive than the defaults+machine baseline. Machine overrides
+ * of defaults are unconstrained (the operator's prerogative). See ADR-0009.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -19,6 +21,7 @@ import {
 	projectConfigDir,
 	expandTilde,
 } from "./utils.js";
+import type { SecurityLimits } from "./rate-limiter.js";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -44,11 +47,67 @@ export interface AuditConfig {
 	maxFiles: number;
 }
 
+/**
+ * A single injection-detection rule. `pattern` is a raw regex string compiled
+ * at runtime (case-insensitive). Invalid patterns are skipped by the scanner.
+ */
+export interface InjectionRule {
+	name: string;
+	pattern: string;
+}
+
+/**
+ * Injection-detection configuration. Machine-only: a project-layer
+ * `injection-rules.json` is ignored (warned) so a checked-in file cannot
+ * weaken detection. See ADR-0006.
+ */
+export interface InjectionRulesConfig {
+	patterns: InjectionRule[];
+	threshold: number;
+}
+
+/**
+ * Rate-limiting policy. Machine-only (see `loadSecurityPolicy`): a
+ * project-layer `security-policy.json` cannot raise limits or disable
+ * rate limiting. Follows the same baseline-strengthening principle as
+ * `audit-config.json` and `injection-rules.json` (ADR-0009).
+ *
+ * The shape is shared with the rate limiter (`SecurityLimits`), which
+ * owns the definition so it has no inbound lib dependencies.
+ */
+export type SecurityPolicy = SecurityLimits;
+
+/**
+ * Shipped default rate-limiting policy. Generous thresholds that avoid
+ * blocking legitimate heavy workflows while still capping runaway loops
+ * (tool_calls) and dialog spam (confirmations). Audit writes are
+ * deliberately NOT rate-limited (see ADR-0010): silently dropping
+ * forensic entries would let an attacker suppress evidence by flooding
+ * the log. The three trailing anomaly thresholds are consumed by the
+ * metrics scanner (P2-5); they are populated here so callers reading
+ * `config.securityPolicy` always see them.
+ */
+export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
+	toolCallsPerTurn: 100,
+	confirmationsPerSession: 200,
+	tokensPerTurnWarn: 8000,
+	toolCallsPerMinuteWarn: 60,
+	tokensSessionWarn: 50000,
+};
+
 export interface Config {
 	protectedPaths: ProtectedPathsConfig;
 	commandRules: CommandRulesConfig;
 	allowedExternal: AllowedExternalConfig;
 	audit: AuditConfig;
+	injection: InjectionRulesConfig;
+	/**
+	 * Rate-limiting policy (machine-only). Optional so existing test
+	 * fixtures that build a `Config` literal do not break; runtime config
+	 * from `loadConfig` always sets this. Code that consumes it must fall
+	 * back to `DEFAULT_SECURITY_POLICY` when absent.
+	 */
+	securityPolicy?: SecurityPolicy;
 	cwd: string;
 }
 
@@ -122,27 +181,157 @@ export function mergePatterns(layers: (string[] | undefined)[]): string[] {
 }
 
 /**
- * Merge protected-paths config across three layers.
+ * Command patterns contributed by the project layer that match every command.
+ * Such patterns would classify all commands as `safe`/`moderate` and disarm the
+ * bash gate. They are rejected (dropped) when coming from the project layer so
+ * the affected commands fall back to `unknown` → confirm. See ADR-0009.
  */
-function mergeProtectedPaths(
+const OVERLY_BROAD_COMMAND_PATTERNS: ReadonlySet<string> = new Set([".*", "^.*$", "^"]);
+
+/**
+ * Case-insensitive membership check, matching the case-insensitive `!`
+ * exclusion semantics in `mergePatterns`.
+ */
+function containsIgnoreCase(patterns: string[], target: string): boolean {
+	const lower = target.toLowerCase();
+	return patterns.some((p) => p.toLowerCase() === lower);
+}
+
+/**
+ * Restrictiveness rank of a protected-path scalar action. Higher = more
+ * restrictive. Used to enforce the immovable-baseline lock on the
+ * `writeAction`/`readAction` scalars (ADR-0009): the project layer may
+ * only make them more restrictive, never weaker.
+ *
+ *   allow   → 0  (least restrictive; readAction only)
+ *   confirm → 1
+ *   block   → 2  (most restrictive)
+ *
+ * Unknown values rank as `confirm` (1) so a malformed project value can
+ * never silently weaken the baseline.
+ */
+function protectedActionRank(action: string | undefined): number {
+	switch (action) {
+		case "allow":
+			return 0;
+		case "confirm":
+			return 1;
+		case "block":
+			return 2;
+		default:
+			return 1; // unknown → treated as confirm
+	}
+}
+
+/**
+ * Return the more restrictive of two protected-path actions. Ties resolve
+ * to the first operand. Undefined operands fall back to `confirm` so the
+ * function is total over its (possibly malformed) input space.
+ */
+function mostRestrictive(
+	a: "block" | "confirm" | "allow" | undefined,
+	b: "block" | "confirm" | "allow" | undefined,
+): "block" | "confirm" | "allow" {
+	return protectedActionRank(a) >= protectedActionRank(b) ? (a ?? "confirm") : (b ?? "confirm");
+}
+
+/**
+ * Merge protected-paths config across three layers.
+ *
+ * The protected-path patterns contributed by the defaults and machine layers
+ * form an immovable baseline. The project layer may add new patterns but cannot
+ * remove baseline patterns via `!`: a project-layer exclusion that targets a
+ * baseline pattern is ignored with a warning (the baseline pattern stays).
+ * Machine-layer exclusions of default patterns are unaffected. See ADR-0009.
+ *
+ * The same immovable-baseline lock applies to the scalar `writeAction` and
+ * `readAction` fields: the project layer may only make them MORE restrictive
+ * (rank order `allow` < `confirm` < `block`). A project-layer value that would
+ * weaken the baseline is ignored with a warning, and the baseline value is
+ * kept. Machine-layer overrides of defaults are unaffected (the operator's
+ * prerogative) — the clamp applies exclusively to the project layer.
+ */
+export function mergeProtectedPaths(
 	layers: [ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined, ProtectedPathsConfig | undefined],
 ): ProtectedPathsConfig {
 	const [def, machine, project] = layers;
 
-	const result: ProtectedPathsConfig = {
-		patterns: mergePatterns([def?.patterns, machine?.patterns, project?.patterns]),
-		writeAction: project?.writeAction ?? machine?.writeAction ?? def?.writeAction ?? "block",
-		readAction: project?.readAction ?? machine?.readAction ?? def?.readAction ?? "confirm",
-	};
+	// Baseline = defaults + machine. Machine exclusions of defaults are honoured.
+	const baseline = mergePatterns([def?.patterns, machine?.patterns]);
 
-	return result;
+	// Apply the project layer, enforcing the immovable-baseline lock.
+	const additions: string[] = [];
+	if (project?.patterns) {
+		for (const p of project.patterns) {
+			if (p.startsWith("!")) {
+				const target = p.slice(1);
+				// The project layer cannot remove baseline patterns.
+				if (containsIgnoreCase(baseline, target)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer protected-path exclusion "${p}" targets a baseline pattern and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+				}
+				// else: excluding a non-existent pattern is a silent no-op,
+				// matching mergePatterns' behaviour.
+				continue;
+			}
+			additions.push(p);
+		}
+	}
+
+	// Baseline scalar actions come from defaults + machine. Machine overrides
+	// defaults (the operator's prerogative); that interaction is unchanged.
+	const baselineWrite: "block" | "confirm" = machine?.writeAction ?? def?.writeAction ?? "block";
+	const baselineRead: "block" | "confirm" | "allow" = machine?.readAction ?? def?.readAction ?? "confirm";
+
+	// Clamp the project layer to the baseline: the project may only make the
+	// scalar actions MORE restrictive (ADR-0009). A weaker project value is
+	// ignored with a warning, and the baseline is kept.
+	let writeAction: "block" | "confirm" = baselineWrite;
+	if (project?.writeAction !== undefined) {
+		if (protectedActionRank(project.writeAction) < protectedActionRank(baselineWrite)) {
+			console.error(`[pi-secured-setup] WARNING: Project-layer writeAction "${project.writeAction}" weakens the baseline "${baselineWrite}" and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+		} else {
+			writeAction = mostRestrictive(baselineWrite, project.writeAction) as "block" | "confirm";
+		}
+	}
+
+	let readAction: "block" | "confirm" | "allow" = baselineRead;
+	if (project?.readAction !== undefined) {
+		if (protectedActionRank(project.readAction) < protectedActionRank(baselineRead)) {
+			console.error(`[pi-secured-setup] WARNING: Project-layer readAction "${project.readAction}" weakens the baseline "${baselineRead}" and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+		} else {
+			readAction = mostRestrictive(baselineRead, project.readAction);
+		}
+	}
+
+	return {
+		patterns: [...baseline, ...additions],
+		writeAction,
+		readAction,
+	};
 }
 
 /**
  * Merge command-rules config across three layers.
  * Each category is merged independently.
+ *
+ * The command-rule patterns contributed by the defaults and machine layers
+ * form an immovable baseline (mirroring `mergeProtectedPaths`, ADR-0009):
+ *
+ *   - The project layer cannot remove a baseline pattern via `!`. A
+ *     project-layer exclusion that targets a baseline pattern is ignored
+ *     with a warning (the baseline pattern stays). Machine-layer exclusions
+ *     of default patterns are unaffected (the operator's prerogative).
+ *
+ *   - Overly-broad `safe`/`moderate` patterns (`.*`, `^.*$`, `^`)
+ *     contributed by the project layer are rejected (dropped) so affected
+ *     commands fall back to `unknown` → confirm.
+ *
+ *   - A `safe`/`moderate` addition whose pattern case-insensitively equals
+ *     a baseline `dangerous`/`external` pattern is rejected (dropped, warn)
+ *     so the project layer cannot shadow a dangerous/external command into
+ *     an auto-approved category. Defaults and machine layers are unaffected.
  */
-function mergeCommandRules(
+export function mergeCommandRules(
 	layers: [CommandRulesConfig | undefined, CommandRulesConfig | undefined, CommandRulesConfig | undefined],
 ): CommandRulesConfig {
 	const [def, machine, project] = layers;
@@ -150,8 +339,58 @@ function mergeCommandRules(
 	const categories: (keyof CommandRulesConfig)[] = ["safe", "moderate", "dangerous", "external"];
 	const result = {} as CommandRulesConfig;
 
+	// Baseline dangerous/external patterns, used by the shadow check below.
+	// Computed from defaults+machine only: the project layer's own additions
+	// are not baseline and do not constrain other project additions.
+	const baselineDangerousOrExternal = [
+		...mergePatterns([def?.dangerous, machine?.dangerous]),
+		...mergePatterns([def?.external, machine?.external]),
+	];
+
 	for (const cat of categories) {
-		result[cat] = mergePatterns([def?.[cat], machine?.[cat], project?.[cat]]);
+		// Baseline = defaults + machine. Machine exclusions of defaults are honoured.
+		const baseline = mergePatterns([def?.[cat], machine?.[cat]]);
+
+		const projectCat = project?.[cat];
+		if (!projectCat) {
+			result[cat] = baseline;
+			continue;
+		}
+
+		// Apply the project layer, enforcing the immovable-baseline lock.
+		const kept: string[] = [];
+		for (const p of projectCat) {
+			if (p.startsWith("!")) {
+				const target = p.slice(1);
+				// The project layer cannot remove baseline patterns.
+				if (containsIgnoreCase(baseline, target)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer ${cat} command-rules exclusion "${p}" targets a baseline pattern and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+					continue;
+				}
+				// Excluding a non-baseline pattern is a silent no-op (matches
+				// mergePatterns behaviour); pass it through unchanged so the
+				// project layer's non-baseline exclusion semantics survive.
+				kept.push(p);
+				continue;
+			}
+
+			// Addition. For safe/moderate, reject overly-broad patterns and
+			// patterns that shadow a baseline dangerous/external pattern.
+			if (cat === "safe" || cat === "moderate") {
+				if (OVERLY_BROAD_COMMAND_PATTERNS.has(p)) {
+					console.error(`[pi-secured-setup] WARNING: Overly broad ${cat} command pattern "${p}" from the project layer was rejected (would classify all commands as ${cat}). The pattern falls back to unknown→confirm.`);
+					continue;
+				}
+				if (containsIgnoreCase(baselineDangerousOrExternal, p)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer ${cat} command pattern "${p}" shadows a baseline dangerous/external pattern and was rejected. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+					continue;
+				}
+			}
+
+			kept.push(p);
+		}
+
+		result[cat] = mergePatterns([baseline, kept]);
 	}
 
 	return result;
@@ -185,6 +424,8 @@ export function ensureMachineConfigDir(): void {
 		"command-rules.json",
 		"allowed-external.json",
 		"audit-config.json",
+		"injection-rules.json",
+		"security-policy.json",
 	];
 
 	for (const file of files) {
@@ -198,6 +439,29 @@ export function ensureMachineConfigDir(): void {
 }
 
 // ── Public API ────────────────────────────────────────────────────────
+
+/**
+ * Load the rate-limiting policy. Machine-only: a project-layer
+ * `security-policy.json` cannot raise limits or disable rate limiting,
+ * so a checked-in file is ignored with a warning. This follows the same
+ * baseline-strengthening principle as `audit-config.json` and
+ * `injection-rules.json` (ADR-0009): the project layer may strengthen
+ * security but never weaken it.
+ *
+ * Resolution order: machine layer → shipped defaults → hard-coded
+ * `DEFAULT_SECURITY_POLICY` fallback.
+ */
+export function loadSecurityPolicy(cwd: string): SecurityPolicy {
+	const projectPath = resolve(projectConfigDir(cwd), "security-policy.json");
+	if (existsSync(projectPath)) {
+		console.error("[pi-secured-setup] WARNING: A project-layer security-policy.json was detected at .pi/security/security-policy.json and will be IGNORED. Rate-limiting policy is machine-only and cannot be configured by the project layer. A checked-in file cannot raise limits or disable rate limiting (see ADR-0009).");
+	}
+	return (
+		readJsonFile<SecurityPolicy>(resolve(MACHINE_CONFIG_DIR, "security-policy.json")) ??
+		readJsonFile<SecurityPolicy>(resolve(DEFAULTS_DIR, "security-policy.json")) ??
+		DEFAULT_SECURITY_POLICY
+	);
+}
 
 /**
  * Load and merge configuration from all three layers.
@@ -217,11 +481,31 @@ export function loadConfig(cwd: string): Config {
 		readJsonFile<AuditConfig>(resolve(DEFAULTS_DIR, "audit-config.json")) ??
 		{ maxFileSize: 10 * 1024 * 1024, maxFiles: 3 };
 
+	// Injection rules are machine-only (ADR-0006). The project layer is
+	// ignored entirely — a checked-in `.pi/security/injection-rules.json`
+	// cannot weaken or disable detection. A detected project-layer file is
+	// warned about so operators know their file had no effect.
+	const projectInjectionPath = resolve(projectConfigDir(cwd), "injection-rules.json");
+	if (existsSync(projectInjectionPath)) {
+		console.error("[pi-secured-setup] WARNING: A project-layer injection-rules.json was detected at .pi/security/injection-rules.json and will be IGNORED. Injection detection rules are machine-only and cannot be configured by the project layer (see ADR-0006).");
+	}
+	const injectionRules: InjectionRulesConfig =
+		readJsonFile<InjectionRulesConfig>(resolve(MACHINE_CONFIG_DIR, "injection-rules.json")) ??
+		readJsonFile<InjectionRulesConfig>(resolve(DEFAULTS_DIR, "injection-rules.json")) ??
+		{ patterns: [], threshold: 3 };
+
+	// Rate-limiting policy is machine-only (same principle as audit-config
+	// and injection-rules, ADR-0009): a checked-in `.pi/security/
+	// security-policy.json` cannot raise limits or disable rate limiting.
+	const securityPolicy = loadSecurityPolicy(cwd);
+
 	const result: Config = {
 		protectedPaths: mergeProtectedPaths(protectedPathsLayers),
 		commandRules: mergeCommandRules(commandRulesLayers),
 		allowedExternal: mergeAllowedExternal(allowedExternalLayers),
 		audit: auditConfig,
+		injection: injectionRules,
+		securityPolicy,
 		cwd,
 	};
 

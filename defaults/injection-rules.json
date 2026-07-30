@@ -1,0 +1,53 @@
+{
+  "patterns": [
+    {
+      "name": "ignore-previous-instructions",
+      "pattern": "ignore (?:all |the |everything |any |your )?(?:previous|prior|above|earlier) (?:instructions|rules|prompts?)"
+    },
+    {
+      "name": "disregard-instructions",
+      "pattern": "disregard (?:everything|all|the|any|every) (?:above|prior|previous|earlier|instructions|rules|prompts?)"
+    },
+    {
+      "name": "forget-instructions",
+      "pattern": "forget (?:all |everything |the |your )?(?:previous |prior |above |earlier )?(?:instructions|rules|prompts?|directives)"
+    },
+    {
+      "name": "override-instructions",
+      "pattern": "override (?:your |the |all )?(?:instructions|rules|prompts?|directives)"
+    },
+    {
+      "name": "new-instructions",
+      "pattern": "new instructions?\\s*[:\\n]"
+    },
+    {
+      "name": "role-reassignment",
+      "pattern": "\\byou are (?:now )?(?:a|an) (?:(?:different|new) (?:assistant|ai|model|agent|llm|bot)|jailbroken|unrestricted|unfiltered|free)\\b"
+    },
+    {
+      "name": "chatml-smuggling",
+      "pattern": "<\\|(?:im_start|im_end|endoftext)\\|>"
+    },
+    {
+      "name": "fake-structural-tags",
+      "pattern": "</?(?:system|developer|assistant)\\b"
+    },
+    {
+      "name": "system-prefix-injection",
+      "pattern": "(?:^|[\\n\\r])[ \\t]{0,3}(?:system|developer)[ \\t]*:"
+    },
+    {
+      "name": "bracketed-system-prefix",
+      "pattern": "(?:^|[\\n\\r])[ \\t]{0,3}\\[(?:system|developer|assistant|admin)\\]"
+    },
+    {
+      "name": "prompt-extraction",
+      "pattern": "reveal (?:your|the) (?:system )?(?:prompt|instructions?)"
+    },
+    {
+      "name": "repeat-above",
+      "pattern": "repeat (?:the )?(?:words?|instructions?|text|rules) above"
+    }
+  ],
+  "threshold": 3
+}

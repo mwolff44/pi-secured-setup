@@ -3,20 +3,28 @@
  *
  * Audit entries are appended to `~/.pi/agent/security/audit.jsonl`.
  * Log rotation is configurable via `audit-config.json`.
+ *
+ * Tamper-evidence (ADR-0007): each entry carries `seq`, `prevHash`, and
+ * `hash` forming an HMAC-SHA256 forward chain keyed by a machine-local
+ * `audit.key` (mode 0o600). Insertion/deletion/modification of any entry
+ * breaks the chain and is reported by `/security:verify`.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
+	mkdirSync,
 	readFileSync,
 	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { resolve } from "node:path";
-import type { Config, AuditConfig } from "./config.js";
-import { MACHINE_CONFIG_DIR, generateSessionId } from "./utils.js";
+import { resolve, dirname } from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { Config } from "./config.js";
+import { MACHINE_CONFIG_DIR, generateSessionId, sha256, hmacSha256 } from "./utils.js";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -28,6 +36,12 @@ export interface AuditEntry {
 	type: string;
 	severity: AuditSeverity;
 	details: Record<string, unknown>;
+	/** Monotonic per-file sequence number (chained entries only). */
+	seq?: number;
+	/** Hash of the previous entry in this file (`"GENESIS"` for the first). */
+	prevHash?: string;
+	/** HMAC-SHA256(key, prevHash || sha256(canonicalJSON(body))). */
+	hash?: string;
 }
 
 // ── Audit logger ──────────────────────────────────────────────────────
@@ -37,10 +51,63 @@ let _auditFile = resolve(MACHINE_CONFIG_DIR, "audit.jsonl");
 /**
  * Override the audit file path for testing. Returns the previous value
  * so tests can restore it in afterEach.
+ *
+ * The HMAC key path is derived from the audit file's directory, so
+ * overriding this also isolates the key to the same temp directory.
  */
 export function _setAuditFileForTest(path: string): string {
 	const prev = _auditFile;
 	_auditFile = path;
+	_cachedKey = null; // invalidate; key path is derived from _auditFile
+	_chainCache = null; // invalidate; cached state was for the previous file
+	return prev;
+}
+
+// ── Chain-state cache (L2) ────────────────────────────────────────────
+//
+// `computeChainStateAndMigrate` previously re-read the entire audit file on
+// every `auditLog` to recover (prevHash, last seq). After the first write in
+// a file the chain state is known, so we cache it and elide the read on
+// subsequent writes. The cache is keyed by `_auditFile` and validated by the
+// file size: a write outside this module (e.g. `/security:clean` re-sealing,
+// or a test renaming the file) changes the size, invalidating the cache so
+// we re-read and recover the correct state. The cache is also invalidated
+// explicitly on rotation (`maybeRotate` replaces the file) and on
+// `_setAuditFileForTest` (tests point the logger at a new temp file).
+
+let _chainCache: { file: string; prevHash: string; seq: number; size: number } | null = null;
+
+/**
+ * Test-only counter: increments each time `computeChainStateAndMigrate`
+ * performs a full-file read (cache miss). Lets the L2 perf test assert the
+ * 2nd write in a file does NOT re-read it, without depending on fs mocking.
+ */
+let _chainStateReadsForTest = 0;
+export function _getChainStateReadsForTest(): number {
+	return _chainStateReadsForTest;
+}
+export function _resetChainStateReadsForTest(): void {
+	_chainStateReadsForTest = 0;
+}
+
+/**
+ * Rotation config override (test-only). `maybeRotate` normally reads
+ * `audit-config.json` from {@link MACHINE_CONFIG_DIR}, which points at
+ * the user's real home directory. Tests cannot safely write a small
+ * threshold there (it would pollute the developer's machine and race
+ * with parallel test files sharing the home dir), and driving the
+ * shipped 10 MB default means writing ~40 MB of fixtures per rotation
+ * case. This hook lets rotation unit tests inject a tiny threshold so
+ * multi-file rotation, overflow cleanup, and the `audit.roll` seal can
+ * be exercised deterministically. Pass `null` to restore the
+ * file-read behaviour.
+ */
+let _rotationConfigOverride: { maxFileSize: number; maxFiles: number } | null = null;
+export function _setRotationConfigForTest(
+	config: { maxFileSize: number; maxFiles: number } | null,
+): { maxFileSize: number; maxFiles: number } | null {
+	const prev = _rotationConfigOverride;
+	_rotationConfigOverride = config;
 	return prev;
 }
 
@@ -60,29 +127,384 @@ export function getSessionId(): string {
 	return _sessionId;
 }
 
+// ── HMAC key management (ADR-0007) ────────────────────────────────────
+
+const GENESIS_HASH = "GENESIS";
+
 /**
- * Append a single audit entry to the JSONL log.
+ * Required HMAC key length in bytes (ADR-0007). Single source of truth
+ * for both the acceptance threshold in {@link loadAuditKey} and the
+ * `randomBytes` generation call.
  */
-export function auditLog(
+const AUDIT_KEY_BYTES = 32;
+
+let _cachedKey: Buffer | null = null;
+
+/**
+ * Resolve the audit key path. Co-located with the audit file so that
+ * overriding the audit file path for tests also isolates the key.
+ */
+function getAuditKeyPath(): string {
+	return resolve(dirname(_auditFile), "audit.key");
+}
+
+/**
+ * Load (or generate on first run) the {@link AUDIT_KEY_BYTES}-byte HMAC
+ * key. The key is written with mode 0o600 on POSIX. Returns null if the
+ * key cannot be loaded or generated — callers must handle this gracefully
+ * (append without hash).
+ *
+ * A pre-existing key file shorter than {@link AUDIT_KEY_BYTES} bytes is
+ * treated as a misconfiguration: a warning is logged, and a fresh
+ * {@link AUDIT_KEY_BYTES}-byte key is generated and OVERWRITES the short
+ * file. Regenerating the key means the HMAC chain can no longer verify
+ * entries signed with the old (short) key — `verifyAuditChain` will
+ * report those legacy entries as hash-mismatched. This is correct: a
+ * short key was never a trustworthy signing key, and the regenerated
+ * key starts a trustworthy chain going forward. The legacy entries
+ * remain in the append-only log but verify as broken, which honestly
+ * reflects the prior misconfiguration.
+ */
+function loadAuditKey(): Buffer | null {
+	if (_cachedKey) return _cachedKey;
+
+	const keyPath = getAuditKeyPath();
+	try {
+		if (existsSync(keyPath)) {
+			const raw = readFileSync(keyPath);
+			// Accept the key only if it meets the minimum length. A short
+			// key (e.g. an operator hand-wrote 4 bytes) is rejected and
+			// falls through to the regeneration path below — defense in
+			// depth for the documented "32 random bytes" contract.
+			if (raw && raw.length >= AUDIT_KEY_BYTES) {
+				_cachedKey = raw;
+				return _cachedKey;
+			}
+			if (raw && raw.length > 0) {
+				console.error(
+					`[pi-secured-setup] audit key too short (${raw.length} bytes); regenerating a secure ${AUDIT_KEY_BYTES}-byte key.`,
+				);
+			}
+		}
+		// Generate a new AUDIT_KEY_BYTES-byte key (first run, missing
+		// file, empty file, or rejected-too-short file).
+		const key = randomBytes(AUDIT_KEY_BYTES);
+		mkdirSync(dirname(keyPath), { recursive: true });
+		writeFileSync(keyPath, key, { mode: 0o600 });
+		ensureKeyFileMode(keyPath);
+		_cachedKey = key;
+		return _cachedKey;
+	} catch (err) {
+		console.error("[pi-secured-setup] audit key load failed:", err);
+		return null;
+	}
+}
+
+/**
+ * Best-effort: re-chmod the key file to 0o600 on POSIX if it already
+ * exists with overly-open permissions. The `mode` option passed to
+ * writeFileSync only applies on file creation; this corrects any
+ * pre-existing file that was created with looser perms.
+ */
+function ensureKeyFileMode(keyPath: string): void {
+	if (process.platform === "win32") return;
+	if (!existsSync(keyPath)) return;
+	try {
+		const mode = statSync(keyPath).mode & 0o777;
+		if (mode !== 0o600) {
+			chmodSync(keyPath, 0o600);
+		}
+	} catch {
+		// Best-effort: don't crash if chmod fails.
+	}
+}
+
+// ── Canonical JSON & hash computation ─────────────────────────────────
+
+/**
+ * Deterministic JSON serialisation: object keys sorted recursively,
+ * no extra whitespace. Arrays preserve order. Used to produce a stable
+ * input to the body hash so the chain verifies across implementations.
+ */
+function canonicalJSON(value: unknown): string {
+	if (value === null || typeof value !== "object") {
+		return JSON.stringify(value);
+	}
+	if (Array.isArray(value)) {
+		return "[" + value.map(canonicalJSON).join(",") + "]";
+	}
+	const obj = value as Record<string, unknown>;
+	const keys = Object.keys(obj).sort();
+	return (
+		"{" +
+		keys
+			.map((k) => JSON.stringify(k) + ":" + canonicalJSON(obj[k]))
+			.join(",") +
+		"}"
+	);
+}
+
+/**
+ * Body = entry without `hash` and `prevHash` (so the body still carries
+ * `seq`, `timestamp`, `sessionId`, `type`, `severity`, `details`).
+ */
+function entryBody(entry: AuditEntry): Record<string, unknown> {
+	const body: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(entry)) {
+		if (k === "hash" || k === "prevHash") continue;
+		body[k] = v;
+	}
+	return body;
+}
+
+/**
+ * Compute the chained hash for an entry.
+ *   hash = HMAC-SHA256(key, prevHash || sha256(canonicalJSON(body)))
+ */
+function computeEntryHash(entry: AuditEntry, key: Buffer, prevHash: string): string {
+	const bodyHash = sha256(canonicalJSON(entryBody(entry)));
+	return hmacSha256(key, prevHash + bodyHash);
+}
+
+/**
+ * Rebuild a brand-new forward chain over `entries` from GENESIS.
+ *
+ * Each entry keeps its body fields (`timestamp`, `sessionId`, `type`,
+ * `severity`, `details`, plus any extras) verbatim, but receives a
+ * fresh `seq` (1..n), `prevHash` (`{@link GENESIS_HASH}` for the first
+ * entry, the prior entry's new `hash` otherwise), and `hash` computed
+ * via {@link computeEntryHash}. Stale `seq`/`prevHash`/`hash` are
+ * dropped and replaced.
+ *
+ * Used by `/security:clean` to re-seal the chain after trimming old
+ * entries so `/security:verify` stays green. Only the key-holder can
+ * produce a valid re-seal — an attacker who deletes entries without
+ * the key cannot forge a passing chain, so verify still detects real
+ * tampering. This mirrors the synthetic-hashing loop inside
+ * {@link computeChainStateAndMigrate} but writes back fresh chain
+ * fields rather than synthesising them only to emit an
+ * `audit.migrate` record.
+ *
+ * Exported so tests can build valid chains from arbitrary timestamps.
+ */
+export function rechainEntries(entries: AuditEntry[], key: Buffer): AuditEntry[] {
+	let prevHash = GENESIS_HASH;
+	let seq = 0;
+	const out: AuditEntry[] = [];
+	for (const entry of entries) {
+		seq++;
+		// Clone non-chain fields verbatim, drop stale seq/prevHash/hash.
+		const rebuilt: AuditEntry = { ...entry } as AuditEntry;
+		delete (rebuilt as Partial<AuditEntry>).seq;
+		delete (rebuilt as Partial<AuditEntry>).prevHash;
+		delete (rebuilt as Partial<AuditEntry>).hash;
+		rebuilt.seq = seq;
+		rebuilt.prevHash = prevHash;
+		rebuilt.hash = computeEntryHash(rebuilt, key, prevHash);
+		prevHash = rebuilt.hash;
+		out.push(rebuilt);
+	}
+	return out;
+}
+
+/**
+ * Read all entries from the current audit file. Returns [] on missing
+ * or unreadable file. Malformed lines are skipped.
+ */
+function readAllEntries(file: string): AuditEntry[] {
+	if (!existsSync(file)) return [];
+	try {
+		const content = readFileSync(file, "utf-8").trim();
+		if (!content) return [];
+		const entries: AuditEntry[] = [];
+		for (const line of content.split("\n")) {
+			try {
+				entries.push(JSON.parse(line) as AuditEntry);
+			} catch {
+				// Skip malformed lines
+			}
+		}
+		return entries;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Determine the chain state (prevHash + last seq) of the current file.
+ *
+ * If the file contains pre-existing unchained entries (no hash/seq/prevHash),
+ * exactly one `audit.migrate` record is appended to seal the transition
+ * before returning. The migrate record's `prevHash` is the synthetic hash
+ * of the last unchained entry (computed over its available fields, chained
+ * from GENESIS through all prior unchained entries).
+ *
+ * Returns `{ prevHash: GENESIS_HASH, seq: 0 }` for an empty or missing file.
+ */
+function computeChainStateAndMigrate(key: Buffer | null): {
+	prevHash: string;
+	seq: number;
+} {
+	// L2: cache hit — elide the full-file read on repeat writes to the same
+	// file. The cache holds the chain state + post-write size of the last
+	// appended entry. Validate with a cheap stat: if the file size matches,
+	// nothing outside this module has rewritten it, so the next entry resumes
+	// from (cache.prevHash, cache.seq) without reading. A size mismatch (or a
+	// missing/unstatable file) invalidates the cache so we re-read.
+	if (_chainCache && _chainCache.file === _auditFile) {
+		try {
+			if (statSync(_auditFile).size === _chainCache.size) {
+				return { prevHash: _chainCache.prevHash, seq: _chainCache.seq };
+			}
+		} catch {
+			// file missing/unstatable → stale cache
+		}
+		_chainCache = null;
+	}
+	_chainStateReadsForTest++; // L2: ticks once per full-file read in this path
+	const entries = readAllEntries(_auditFile);
+	if (entries.length === 0) return { prevHash: GENESIS_HASH, seq: 0 };
+
+	const last = entries[entries.length - 1];
+	if (
+		typeof last.hash === "string" &&
+		typeof last.seq === "number" &&
+		typeof last.prevHash === "string"
+	) {
+		// Already chained — resume.
+		return { prevHash: last.hash, seq: last.seq };
+	}
+
+	// File has unchained entries. Walk them, compute synthetic hashes,
+	// and emit a single `audit.migrate` record to seal the transition.
+	if (!key) {
+		// No key available — cannot compute synthetic hashes or seal.
+		// Best-effort: chain from GENESIS.
+		return { prevHash: GENESIS_HASH, seq: 0 };
+	}
+
+	let prevHash = GENESIS_HASH;
+	let seq = 0;
+	let unchainedCount = 0;
+	for (const e of entries) {
+		if (
+			typeof e.hash === "string" &&
+			typeof e.seq === "number" &&
+			typeof e.prevHash === "string"
+		) {
+			prevHash = e.hash;
+			seq = e.seq;
+			continue;
+		}
+		unchainedCount++;
+		const synthetic = computeEntryHash(e, key, prevHash);
+		prevHash = synthetic;
+	}
+
+	// Append the migrate record (sealed with the chain).
+	const migrate: AuditEntry = {
+		timestamp: new Date().toISOString(),
+		sessionId: _sessionId,
+		type: "audit.migrate",
+		severity: "info",
+		details: { migratedCount: unchainedCount },
+		seq: seq + 1,
+		prevHash,
+	};
+	migrate.hash = computeEntryHash(migrate, key, prevHash);
+	try {
+		appendFileSync(_auditFile, JSON.stringify(migrate) + "\n", "utf-8");
+	} catch (err) {
+		console.error("[pi-secured-setup] audit.migrate append failed:", err);
+	}
+	return { prevHash: migrate.hash as string, seq: migrate.seq as number };
+}
+
+/**
+ * Internal: append a single chained entry to the current file. Used by
+ * both `auditLog` (user events) and `maybeRotate` (the `audit.roll` seal).
+ * Does NOT trigger rotation.
+ *
+ * SECURITY: this path is intentionally NOT rate-limited. For a
+ * tamper-evident forensic log, silently dropping an entry when a rate
+ * budget is exhausted would be an anti-pattern: an attacker who triggers
+ * a flood could suppress the evidence of their real actions by pushing
+ * legitimate entries out of the window. The real DoS surface (disk fill)
+ * is already bounded by rotation (`maxFileSize` × `maxFiles` ≈ 30 MB
+ * cap), and the write rate is already indirectly bounded by the
+ * `tool_calls`-per-turn cap, since every audited Guard event originates
+ * from a rate-limited tool call. See ADR-0010.
+ */
+function appendChained(
 	type: string,
 	severity: AuditSeverity,
 	details: Record<string, unknown>,
 ): void {
+	ensureLogExists();
+	const key = loadAuditKey();
+	const state = computeChainStateAndMigrate(key);
 	const entry: AuditEntry = {
 		timestamp: new Date().toISOString(),
 		sessionId: _sessionId,
 		type,
 		severity,
 		details,
+		seq: state.seq + 1,
+		prevHash: state.prevHash,
 	};
+	if (key) {
+		entry.hash = computeEntryHash(entry, key, state.prevHash);
+	}
+	appendFileSync(_auditFile, JSON.stringify(entry) + "\n", "utf-8");
+	// L2: cache the just-written entry's chain state so the next write to
+	// the same file resumes without re-reading. Only cache when the entry
+	// is actually chained (key present); an unchained entry has no usable
+	// prevHash, so we leave the cache unset and the next call re-reads.
+	// Track the post-write file size to detect external rewrites.
+	if (typeof entry.hash === "string") {
+		try {
+			_chainCache = {
+				file: _auditFile,
+				prevHash: entry.hash,
+				seq: state.seq + 1,
+				size: statSync(_auditFile).size,
+			};
+		} catch {
+			_chainCache = null;
+		}
+	}
+}
 
+/**
+ * Append a single audit entry to the JSONL log. Best-effort: if hashing
+ * or chained-append fails, the entry is still appended without hash fields
+ * so logging never blocks the extension.
+ */
+export function auditLog(
+	type: string,
+	severity: AuditSeverity,
+	details: Record<string, unknown>,
+): void {
 	try {
-		ensureLogExists();
-		appendFileSync(_auditFile, JSON.stringify(entry) + "\n", "utf-8");
+		appendChained(type, severity, details);
 		maybeRotate();
 	} catch (err) {
 		// Audit logging must never crash the extension.
 		console.error("[pi-secured-setup] audit log write failed:", err);
+		// Fallback: append a plain unchained entry so the event is recorded.
+		try {
+			ensureLogExists();
+			const basic: AuditEntry = {
+				timestamp: new Date().toISOString(),
+				sessionId: _sessionId,
+				type,
+				severity,
+				details,
+			};
+			appendFileSync(_auditFile, JSON.stringify(basic) + "\n", "utf-8");
+		} catch (innerErr) {
+			console.error("[pi-secured-setup] audit log fallback write failed:", innerErr);
+		}
 	}
 }
 
@@ -98,14 +520,22 @@ function ensureLogExists(): void {
  * Check if rotation is needed and perform it.
  * Rotation renames the current log to `audit.jsonl.1`, `audit.jsonl.2`, etc.
  * Files beyond `maxFiles` are deleted.
+ *
+ * Before renaming, the current file is sealed with an `audit.roll` entry
+ * (chained) so the rotated file is self-contained and verifiable. The new
+ * empty file starts a fresh chain (`prevHash = "GENESIS"`).
  */
 function maybeRotate(): void {
-	let config: AuditConfig;
-	try {
-		const raw = readFileSync(resolve(MACHINE_CONFIG_DIR, "audit-config.json"), "utf-8");
-		config = JSON.parse(raw);
-	} catch {
-		config = { maxFileSize: 10 * 1024 * 1024, maxFiles: 3 };
+	let config: { maxFileSize: number; maxFiles: number };
+	if (_rotationConfigOverride) {
+		config = _rotationConfigOverride;
+	} else {
+		try {
+			const raw = readFileSync(resolve(MACHINE_CONFIG_DIR, "audit-config.json"), "utf-8");
+			config = JSON.parse(raw);
+		} catch {
+			config = { maxFileSize: 10 * 1024 * 1024, maxFiles: 3 };
+		}
 	}
 
 	let size: number;
@@ -116,6 +546,18 @@ function maybeRotate(): void {
 	}
 
 	if (size < config.maxFileSize) return;
+
+	// Seal the current file with an `audit.roll` entry before rotating.
+	// Best-effort: if this fails, continue rotation without the seal.
+	try {
+		appendChained("audit.roll", "info", {
+			reason: "size-threshold",
+			size,
+			threshold: config.maxFileSize,
+		});
+	} catch (err) {
+		console.error("[pi-secured-setup] audit.roll seal failed:", err);
+	}
 
 	// Delete the oldest rotated file to prevent stale data and Windows rename conflicts
 	const oldestFile = `${_auditFile}.${config.maxFiles}`;
@@ -141,6 +583,12 @@ function maybeRotate(): void {
 
 	// Ensure new empty log file exists with correct permissions
 	ensureLogExists();
+
+	// L2: the file at `_auditFile` is now a fresh empty chain (the rolled
+	// content moved to `.1`). The cached chain state — if any — described
+	// the rolled content and is stale; invalidate so the next write re-reads
+	// the empty file and resumes from GENESIS.
+	_chainCache = null;
 
 	// Remove files beyond maxFiles (cleanup of any leftover overflow files)
 	for (let i = config.maxFiles + 1; ; i++) {
@@ -228,6 +676,343 @@ function countSessionEvents(): {
 	return { blocked, confirmed, autoApproved, secretsRedacted };
 }
 
+/**
+ * Session metrics aggregated from `turn.metrics` audit events written by
+ * the metrics scanner (P2-5). Surfaces token totals and an approximate
+ * tool-calls-per-minute figure on the `/security` dashboard.
+ */
+export interface SessionMetrics {
+	/** Cumulative tokens this session (sum of `tokensTurn` per turn.metrics). */
+	tokensSession: number;
+	/** Number of provider turns observed this session. */
+	turnCount: number;
+	/**
+	 * Approximate tool calls per minute: count of `turn.metrics` events
+	 * recorded in the last 60 seconds (sliding window). Each provider
+	 * round-trip counts as one event.
+	 */
+	toolCallsPerMinute: number;
+}
+
+/**
+ * Aggregate `turn.metrics` events for the current session into a
+ * `SessionMetrics` summary. Returns zeroed metrics when the log is
+ * missing or empty. Used by the `/security` dashboard.
+ */
+export function aggregateSessionMetrics(): SessionMetrics {
+	const result: SessionMetrics = {
+		tokensSession: 0,
+		turnCount: 0,
+		toolCallsPerMinute: 0,
+	};
+	if (!existsSync(_auditFile)) return result;
+
+	try {
+		const content = readFileSync(_auditFile, "utf-8").trim();
+		if (!content) return result;
+
+		const now = Date.now();
+		let recent = 0;
+		for (const line of content.split("\n")) {
+			let entry: AuditEntry;
+			try {
+				entry = JSON.parse(line) as AuditEntry;
+			} catch {
+				continue;
+			}
+			if (entry.sessionId !== _sessionId) continue;
+			if (entry.type !== "turn.metrics") continue;
+
+			result.turnCount++;
+			const turnTokens = entry.details.tokensTurn;
+			if (typeof turnTokens === "number") result.tokensSession += turnTokens;
+
+			const ts = Date.parse(entry.timestamp);
+			if (!Number.isNaN(ts) && now - ts <= 60_000) recent++;
+		}
+		result.toolCallsPerMinute = recent;
+	} catch {
+		// fall through with whatever was accumulated
+	}
+	return result;
+}
+
+// ── Chain verification (ADR-0007) ─────────────────────────────────────
+
+/**
+ * Constant-time string equality for MAC/hash verification (N1).
+ *
+ * `!==` on hash strings is practically unexploitable here (the attacker has
+ * no oracle: forging a candidate hash requires the HMAC key, which is not
+ * the value being compared), but `timingSafeEqual` is the canonical pattern
+ * for MAC verification and hardens the "tamper-evident" claim on principle.
+ * Length mismatch short-circuits to `false` (the lengths themselves are not
+ * secret — they are SHA-256 hex digests of fixed length).
+ */
+function safeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	return timingSafeEqual(Buffer.from(a, "utf-8"), Buffer.from(b, "utf-8"));
+}
+
+export interface FileVerification {
+	file: string;
+	ok: boolean;
+	entries: number;
+	/** `seq` of the entry where the chain breaks (chained entries only). */
+	brokenAtSeq?: number;
+	/** 0-based line index where verification failed. */
+	brokenAtIndex?: number;
+	/** Human-readable reason for the failure. */
+	reason?: string;
+}
+
+/**
+ * Verify a single file's chain. Walks entries, recomputes each chained
+ * entry's hash, and verifies the forward link to the previous entry.
+ * Pre-existing unchained entries are walked with synthetic hashes so the
+ * chain can pass through them to any subsequent `audit.migrate` record.
+ *
+ * Each file starts from `prevHash = "GENESIS"` (files are independently
+ * verifiable; `audit.roll` is the logical end-of-file marker).
+ *
+ * @param file              — Path to the file to verify.
+ * @param key               — HMAC key (null ⇒ cannot verify chained entries).
+ * @param rotatedFilesExist — When true, an empty file is treated as
+ *   evidence of truncation and reported as `ok:false` (see H1). Used for
+ *   the active `audit.jsonl` when rotated `.N` files are present: an empty
+ *   current file alongside non-empty rotated files is strong evidence of
+ *   erasure. Defaults to `false` so existing call sites (rotated-file
+ *   verification) keep their benign-empty-file semantics.
+ */
+function verifyFile(file: string, key: Buffer | null, rotatedFilesExist = false): FileVerification {
+	if (!existsSync(file)) {
+		return { file, ok: true, entries: 0 };
+	}
+
+	let content: string;
+	try {
+		content = readFileSync(file, "utf-8");
+	} catch (err) {
+		return {
+			file,
+			ok: false,
+			entries: 0,
+			reason: `unreadable file: ${(err as Error).message}`,
+		};
+	}
+
+	const trimmed = content.trim();
+	if (!trimmed) {
+		if (rotatedFilesExist) {
+			return {
+				file,
+				ok: false,
+				entries: 0,
+				reason: "current audit file is empty but rotated files exist — possible truncation",
+			};
+		}
+		return { file, ok: true, entries: 0 };
+	}
+
+	const lines = trimmed.split("\n");
+	let prevHash = GENESIS_HASH;
+	let expectedSeq = 1;
+	let entries = 0;
+
+	for (let i = 0; i < lines.length; i++) {
+		let entry: AuditEntry;
+		try {
+			entry = JSON.parse(lines[i]) as AuditEntry;
+		} catch {
+			return {
+				file,
+				ok: false,
+				entries,
+				brokenAtIndex: i,
+				reason: "malformed JSON line",
+			};
+		}
+		entries++;
+
+		const isChained =
+			typeof entry.hash === "string" &&
+			typeof entry.prevHash === "string" &&
+			typeof entry.seq === "number";
+
+		if (isChained) {
+			if (!key) {
+				return {
+					file,
+					ok: false,
+					entries,
+					brokenAtSeq: entry.seq,
+					brokenAtIndex: i,
+					reason: "audit key unavailable — cannot verify",
+				};
+			}
+		if (!safeEqual(entry.prevHash as string, prevHash)) {
+			return {
+				file,
+				ok: false,
+				entries,
+				brokenAtSeq: entry.seq,
+				brokenAtIndex: i,
+				reason: `chain link broken: prevHash does not match preceding entry`,
+			};
+		}
+			if (entry.seq !== expectedSeq) {
+				return {
+					file,
+					ok: false,
+					entries,
+					brokenAtSeq: entry.seq,
+					brokenAtIndex: i,
+					reason: `seq mismatch: expected ${expectedSeq}, got ${entry.seq}`,
+				};
+			}
+		const expected = computeEntryHash(entry, key, entry.prevHash as string);
+		if (!safeEqual(entry.hash as string, expected)) {
+			return {
+				file,
+				ok: false,
+				entries,
+				brokenAtSeq: entry.seq,
+				brokenAtIndex: i,
+				reason: "hash mismatch — entry modified or forged",
+			};
+		}
+			prevHash = entry.hash as string;
+			expectedSeq = (entry.seq as number) + 1;
+		} else if (key) {
+			// Pre-existing unchained entry: compute synthetic hash so the
+			// chain can continue through it to a subsequent audit.migrate.
+			prevHash = computeEntryHash(entry, key, prevHash);
+		}
+		// If no key and entry is unchained, accept without verification.
+	}
+
+	return { file, ok: true, entries };
+}
+
+/**
+ * Defensive upper bound on rotated-file-number scanning. Legitimately
+ * there are never more than `maxFiles` (default 3) rotated files; this
+ * cap prevents unbounded scanning if the filesystem were somehow
+ * populated with adversarial `.N` suffixes.
+ */
+const MAX_ROTATION_SCAN = 99;
+
+/**
+ * Replay the chain over the current file and all rotated files (`.N` … `.1`,
+ * oldest first). Returns one `FileVerification` per file in oldest-first
+ * order. Used by the `/security:verify` command and by tests.
+ *
+ * Rotation-sequence gap detection (R9 follow-up): the scan walks every
+ * file number from 1 up to the highest present number (capped at
+ * {@link MAX_ROTATION_SCAN}) instead of stopping at the first missing
+ * one. A retained middle file deleted by a keyless attacker (e.g. `.2`
+ * removed while `.1` and `.3` remain) would otherwise halt the scan at
+ * `.2` and silently ignore `.3`, leaving the deletion undetected. Each
+ * missing number strictly below the highest present file is now reported
+ * as a `FileVerification` gap finding (`ok:false`) so silent deletion of
+ * a whole retained file is surfaced. Files beyond the highest present
+ * number are absent due to age-out past `maxFiles` or because rotation
+ * has not reached them yet — those are NOT flagged.
+ *
+ * Each rotated file remains independently chain-verified from GENESIS
+ * (per ADR-0007); cross-file crypto binding is an accepted residual
+ * risk bounded by key custody (see ADR-0007 Consequences).
+ */
+export function verifyAuditChain(): FileVerification[] {
+	const key = loadAuditKey();
+	const results: FileVerification[] = [];
+
+	// Discover ALL rotated files present, up to a defensive cap. We do
+	// NOT stop at the first missing file: a keyless attacker who
+	// deletes a retained middle file (e.g. `.2` while `.1` and `.3`
+	// exist) would otherwise cause the scan to halt at `.2` and `.3`
+	// would be silently ignored — the deletion undetected.
+	const present = new Set<number>();
+	let maxPresent = 0;
+	for (let i = 1; i <= MAX_ROTATION_SCAN; i++) {
+		if (existsSync(`${_auditFile}.${i}`)) {
+			present.add(i);
+			if (i > maxPresent) maxPresent = i;
+		}
+	}
+
+	// Emit verifications oldest-first (maxPresent → 1), inserting gap
+	// findings for any missing file number strictly below maxPresent.
+	// A gap means a retained middle file is absent — the per-file chain
+	// still catches content tampering, but silent deletion of a whole
+	// retained file would otherwise be missed. Files above maxPresent
+	// are intentionally absent (age-out / not-yet-rotated) and are NOT
+	// flagged.
+	for (let i = maxPresent; i >= 1; i--) {
+		if (present.has(i)) {
+			results.push(verifyFile(`${_auditFile}.${i}`, key));
+		} else {
+			results.push({
+				file: `${_auditFile}.${i}`,
+				ok: false,
+				entries: 0,
+				reason: "rotated file missing — gap in rotation sequence (possible deletion)",
+			});
+		}
+	}
+	// Active-file truncation/deletion detection (H1): an empty or missing
+	// current file when rotated `.N` files exist is strong evidence of
+	// erasure of the most recent evidence. `verifyFile` flags the empty
+	// case when `rotatedFilesExist` is true; the missing case is flagged
+	// here. With no rotated files, a missing/empty current file is the
+	// normal first-run state and must NOT be flagged (T7/T7b guards).
+	if (existsSync(_auditFile)) {
+		results.push(verifyFile(_auditFile, key, maxPresent > 0));
+	} else if (maxPresent > 0) {
+		results.push({
+			file: _auditFile,
+			ok: false,
+			entries: 0,
+			reason: "current audit file missing but rotated files exist — possible deletion",
+		});
+	}
+
+	return results;
+}
+
+/**
+ * Human-readable summary of chain verification.
+ */
+function formatVerifyReport(results: FileVerification[]): string {
+	const lines: string[] = [];
+	lines.push("🔍 Audit chain verification");
+	lines.push("");
+	const allOk = results.every((r) => r.ok);
+	if (results.length === 0) {
+		lines.push("No audit files to verify.");
+		return lines.join("\n");
+	}
+	lines.push(allOk ? "✅ All files verified — chain intact." : "❌ Tampering detected.");
+	lines.push("");
+	for (const r of results) {
+		const label = r.file === _auditFile ? `${r.file} (current)` : r.file;
+		if (r.ok) {
+			lines.push(`  ✅ ${label}: ${r.entries} entries, chain intact`);
+		} else {
+			if (r.brokenAtSeq !== undefined) {
+				lines.push(`  ❌ ${label}: broken at seq ${r.brokenAtSeq} — ${r.reason}`);
+			} else if (r.brokenAtIndex !== undefined) {
+				lines.push(`  ❌ ${label}: broken at line ${r.brokenAtIndex} — ${r.reason}`);
+			} else {
+				// No seq/index applies (e.g. a rotation-sequence gap
+				// finding for a missing retained file — R9 follow-up).
+				lines.push(`  ❌ ${label}: ${r.reason}`);
+			}
+		}
+	}
+	return lines.join("\n");
+}
+
 // ── Skill status bridge ───────────────────────────────────────────────
 
 /**
@@ -247,6 +1032,7 @@ export function setSkillStatusFn(fn: typeof _getSkillStatus): void {
 
 function formatDashboard(): string {
 	const counts = countSessionEvents();
+	const metrics = aggregateSessionMetrics();
 	const recent = readRecentEntries(20);
 	const sessionRecent = recent.filter((e) => e.sessionId === _sessionId);
 
@@ -258,6 +1044,15 @@ function formatDashboard(): string {
 	lines.push(`  🟡 Confirmed:     ${counts.confirmed} actions`);
 	lines.push(`  🔵 Auto-approved: ${counts.autoApproved} actions`);
 	lines.push(`  ⚠️  Secrets redacted: ${counts.secretsRedacted}`);
+
+	// Metrics section (P2-5): token totals + tool-call rate, aggregated
+	// from `turn.metrics` audit events. The metrics scanner is an
+	// observer; these numbers are point-in-time approximations derived
+	// from the audit log.
+	lines.push("");
+	lines.push("Metrics (this session):");
+	lines.push(`  📊 Tokens:        ${metrics.tokensSession.toLocaleString()} (${metrics.turnCount} turn${metrics.turnCount === 1 ? "" : "s"})`);
+	lines.push(`  ⚡ Tool calls/min: ${metrics.toolCallsPerMinute}`);
 
 	// Skill status section
 	if (_getSkillStatus) {
@@ -356,7 +1151,13 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 	});
 
 	pi.registerCommand("security:clean", {
-		description: "Trim audit log (remove entries older than N days)",
+		description:
+			"Trim audit log (remove entries older than N days). " +
+			"Re-seals the HMAC forward chain over the kept entries from " +
+			"GENESIS so /security:verify stays green after a user-initiated " +
+			"trim. Only the key-holder can re-seal; an attacker deleting " +
+			"entries without audit.key cannot forge a valid chain, so " +
+			"verify still detects real tampering.",
 		handler: async (args, ctx) => {
 			const days = parseInt(args || "30", 10);
 			if (isNaN(days) || days <= 0) {
@@ -378,25 +1179,88 @@ export function registerAuditCommand(pi: ExtensionAPI, _config: Config): void {
 
 			const lines = content.split("\n");
 			let removed = 0;
-			const kept: string[] = [];
+			const keptEntries: AuditEntry[] = [];
+			const keptRaw: string[] = []; // byte-for-byte original lines (fallback path)
+			const keptMalformed: string[] = []; // unparseable lines, preserved as-is
 
 			for (const line of lines) {
 				try {
 					const entry = JSON.parse(line) as AuditEntry;
 					if (entry.timestamp >= cutoff) {
-						kept.push(line);
+						keptEntries.push(entry);
+						keptRaw.push(line);
 					} else {
 						removed++;
 					}
 				} catch {
-					kept.push(line); // keep malformed lines
+					keptMalformed.push(line); // keep malformed lines
 				}
 			}
 
-			writeFileSync(_auditFile, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
+			// NO-OP when nothing changed: preserve the original file
+			// (and its original hashes) verbatim. No audit.clean event
+			// is emitted, no rewrite, no re-chain. Avoids spurious
+			// rewrites that would invalidate the existing chain.
+			if (removed === 0) {
+				ctx.ui.notify(
+					`Audit log: nothing to clean (0 entries older than ${days} days).`,
+					"info",
+				);
+				return;
+			}
 
-			auditLog("audit.clean", "info", { removed, remaining: kept.length, olderThan: cutoff });
-			ctx.ui.notify(`Cleaned audit log: removed ${removed} entries older than ${days} days.`, "info");
+			const key = loadAuditKey();
+			if (key) {
+				// Re-seal the chain over kept entries from GENESIS so
+				// /security:verify stays green. Only the key-holder can
+				// produce a valid chain.
+				const rechained = rechainEntries(keptEntries, key);
+				const outLines = [
+					...rechained.map((e) => JSON.stringify(e)),
+					...keptMalformed,
+				];
+				writeFileSync(
+					_auditFile,
+					outLines.length > 0 ? outLines.join("\n") + "\n" : "",
+					"utf-8",
+				);
+			} else {
+				// No key available — cannot re-seal. Fall back to writing
+				// the kept entries verbatim (preserving their stale chain
+				// fields). /security:verify will report the chain as
+				// broken, which is honest: without the key we cannot
+				// produce a valid forward chain and cannot distinguish
+				// this trim from attacker deletion.
+				const outLines = [...keptRaw, ...keptMalformed];
+				writeFileSync(
+					_auditFile,
+					outLines.length > 0 ? outLines.join("\n") + "\n" : "",
+					"utf-8",
+				);
+			}
+
+			// Append audit.clean via auditLog. computeChainStateAndMigrate
+			// will detect the already-rechained kept entries (they have
+			// hash/seq/prevHash) and just resume — no double-migrate.
+			auditLog("audit.clean", "info", {
+				removed,
+				remaining: keptEntries.length,
+				olderThan: cutoff,
+				resealed: key !== null,
+			});
+			ctx.ui.notify(
+				`Cleaned audit log: removed ${removed} entries older than ${days} days.`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("security:verify", {
+		description: "Verify audit log chain integrity (HMAC forward-chaining, ADR-0007)",
+		handler: async (_args, ctx) => {
+			const results = verifyAuditChain();
+			const report = formatVerifyReport(results);
+			ctx.ui.notify(report, results.every((r) => r.ok) ? "info" : "warning");
 		},
 	});
 }

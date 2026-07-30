@@ -1,8 +1,11 @@
 /**
  * Unit tests for lib/protected-paths.ts
  */
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { evaluateProtectedPaths, matchGlob } from "../lib/protected-paths.js";
 import type { Config } from "../lib/config.js";
 
@@ -17,6 +20,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
 		commandRules: { safe: [], moderate: [], dangerous: [], external: [] },
 		allowedExternal: { paths: [] },
 		audit: { maxFileSize: 10_000_000, maxFiles: 3 },
+		injection: { patterns: [], threshold: 3 },
 		...overrides,
 	};
 }
@@ -168,5 +172,95 @@ describe("evaluateProtectedPaths", () => {
 		const config = makeConfig();
 		const result = evaluateProtectedPaths("WRITE", { path: ".env" }, config);
 		assert.equal(result.action, "block");
+	});
+});
+
+// ── M1 (Weft): symlink real-target matching ───────────────────────────
+//
+// `evaluateProtectedPaths` previously matched only the lexical path, so an
+// in-boundary symlink whose real target (outside the boundary, or matching
+// a protected pattern by its real name) was not caught. Defense-in-depth:
+// resolve the real target and match patterns against BOTH the lexical and
+// real paths.
+
+describe("evaluateProtectedPaths — symlink real-target matching (M1 Weft)", () => {
+	let boundary: string;
+	let outside: string;
+
+	beforeEach(() => {
+		boundary = mkdtempSync(resolve(tmpdir(), "pi-pp-boundary-"));
+		outside = mkdtempSync(resolve(tmpdir(), "pi-pp-outside-"));
+	});
+
+	afterEach(() => {
+		if (boundary && existsSync(boundary)) rmSync(boundary, { recursive: true, force: true });
+		if (outside && existsSync(outside)) rmSync(outside, { recursive: true, force: true });
+	});
+
+	function cfg(patterns: string[], readAction: "confirm" | "block" | "allow" = "confirm"): Config {
+		return {
+			cwd: boundary,
+			protectedPaths: { patterns, writeAction: "block", readAction },
+			commandRules: { safe: [], moderate: [], dangerous: [], external: [] },
+			allowedExternal: { paths: [] },
+			audit: { maxFileSize: 10_000_000, maxFiles: 3 },
+			injection: { patterns: [], threshold: 3 },
+		};
+	}
+
+	it("matches a symlink whose real target matches a protected pattern (M1 T10)", () => {
+		// secrets.env lives OUTSIDE the boundary; an in-boundary symlink points at it.
+		const realTarget = resolve(outside, "secrets.env");
+		writeFileSync(realTarget, "SECRET=shhh", "utf-8");
+		const linkPath = resolve(boundary, "link");
+		symlinkSync(realTarget, linkPath);
+		assert.ok(existsSync(linkPath), "precondition: symlink exists");
+
+		const config = cfg(["*.env"], "confirm");
+
+		// Reading the in-boundary symlink via a relative path must be caught
+		// because its REAL target basename is `secrets.env` (matches `*.env`).
+		const result = evaluateProtectedPaths("read", { path: "./link" }, config);
+		assert.notEqual(
+			result.action,
+			"allow",
+			`reading an in-boundary symlink to a protected real target must confirm/block, got allow`,
+		);
+		assert.ok(
+			result.action === "confirm" || result.action === "block",
+			`expected confirm or block, got ${result.action}`,
+		);
+	});
+
+	it("matches a symlink whose real target matches a pattern the lexical name does not (M1 T10b)", () => {
+		// The symlink's lexical name is `link` (no protected extension); the
+		// real target is `id_rsa` inside a `.ssh` dir outside the boundary.
+		const realSshDir = resolve(outside, ".ssh");
+		mkdirSync(realSshDir, { recursive: true });
+		const realTarget = resolve(realSshDir, "id_rsa");
+		writeFileSync(realTarget, "key", "utf-8");
+		const linkPath = resolve(boundary, "link");
+		symlinkSync(realTarget, linkPath);
+
+		const config = cfg(["*id_rsa*"], "confirm");
+
+		const result = evaluateProtectedPaths("read", { path: "./link" }, config);
+		assert.notEqual(
+			result.action,
+			"allow",
+			"symlink whose real target matches the protected pattern must be caught",
+		);
+	});
+
+	it("blocks write to an in-boundary symlink pointing at a protected real target (M1 T10c)", () => {
+		const realTarget = resolve(outside, "secrets.env");
+		writeFileSync(realTarget, "SECRET=shhh", "utf-8");
+		const linkPath = resolve(boundary, "link");
+		symlinkSync(realTarget, linkPath);
+
+		const config = cfg(["*.env"]);
+
+		const result = evaluateProtectedPaths("write", { path: "./link" }, config);
+		assert.equal(result.action, "block", "write via symlink to protected real target must block");
 	});
 });
