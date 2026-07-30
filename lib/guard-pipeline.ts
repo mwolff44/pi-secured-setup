@@ -6,10 +6,14 @@
  * No short-circuit past a confirmation.
  *
  * Pipeline order:
- *   0. Input shape validation (read/write/edit/bash) — QW-4
- *   1. Boundary evaluation (read/write/edit only)
- *   2. Protected paths evaluation (read/write/edit only)
- *   3. Bash command classification (bash only)
+ *   0.   Input shape validation (read/write/edit/bash) — QW-4
+ *   0.5. Rate-limit check (tool_calls scope) — P2-3
+ *   1.   Boundary evaluation (read/write/edit only)
+ *   2.   Protected paths evaluation (read/write/edit only)
+ *   3.   Bash command classification (bash only, with exfiltration
+ *        detection running before classification)
+ *
+ * First block wins. No short-circuit past a confirmation.
  */
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_SECURITY_POLICY, type Config } from "./config.js";
