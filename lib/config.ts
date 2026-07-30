@@ -198,27 +198,6 @@ function containsIgnoreCase(patterns: string[], target: string): boolean {
 }
 
 /**
- * Drop overly-broad `safe`/`moderate` patterns contributed by the project
- * layer. Exclusions (prefixed with `!`) are passed through unchanged so the
- * project layer's non-baseline exclusion semantics are preserved. See ADR-0009.
- */
-function rejectBroadProjectPatterns(patterns: string[], category: string): string[] {
-	const kept: string[] = [];
-	for (const p of patterns) {
-		if (p.startsWith("!")) {
-			kept.push(p);
-			continue;
-		}
-		if (OVERLY_BROAD_COMMAND_PATTERNS.has(p)) {
-			console.error(`[pi-secured-setup] WARNING: Overly broad ${category} command pattern "${p}" from the project layer was rejected (would classify all commands as ${category}). The pattern falls back to unknown→confirm.`);
-			continue;
-		}
-		kept.push(p);
-	}
-	return kept;
-}
-
-/**
  * Restrictiveness rank of a protected-path scalar action. Higher = more
  * restrictive. Used to enforce the immovable-baseline lock on the
  * `writeAction`/`readAction` scalars (ADR-0009): the project layer may
@@ -335,9 +314,22 @@ export function mergeProtectedPaths(
  * Merge command-rules config across three layers.
  * Each category is merged independently.
  *
- * Overly-broad `safe`/`moderate` patterns contributed by the project layer are
- * rejected (dropped) so affected commands fall back to `unknown` → confirm.
- * Defaults and machine layers are unaffected. See ADR-0009.
+ * The command-rule patterns contributed by the defaults and machine layers
+ * form an immovable baseline (mirroring `mergeProtectedPaths`, ADR-0009):
+ *
+ *   - The project layer cannot remove a baseline pattern via `!`. A
+ *     project-layer exclusion that targets a baseline pattern is ignored
+ *     with a warning (the baseline pattern stays). Machine-layer exclusions
+ *     of default patterns are unaffected (the operator's prerogative).
+ *
+ *   - Overly-broad `safe`/`moderate` patterns (`.*`, `^.*$`, `^`)
+ *     contributed by the project layer are rejected (dropped) so affected
+ *     commands fall back to `unknown` → confirm.
+ *
+ *   - A `safe`/`moderate` addition whose pattern case-insensitively equals
+ *     a baseline `dangerous`/`external` pattern is rejected (dropped, warn)
+ *     so the project layer cannot shadow a dangerous/external command into
+ *     an auto-approved category. Defaults and machine layers are unaffected.
  */
 export function mergeCommandRules(
 	layers: [CommandRulesConfig | undefined, CommandRulesConfig | undefined, CommandRulesConfig | undefined],
@@ -347,12 +339,58 @@ export function mergeCommandRules(
 	const categories: (keyof CommandRulesConfig)[] = ["safe", "moderate", "dangerous", "external"];
 	const result = {} as CommandRulesConfig;
 
+	// Baseline dangerous/external patterns, used by the shadow check below.
+	// Computed from defaults+machine only: the project layer's own additions
+	// are not baseline and do not constrain other project additions.
+	const baselineDangerousOrExternal = [
+		...mergePatterns([def?.dangerous, machine?.dangerous]),
+		...mergePatterns([def?.external, machine?.external]),
+	];
+
 	for (const cat of categories) {
-		let projectCat = project?.[cat];
-		if (projectCat && (cat === "safe" || cat === "moderate")) {
-			projectCat = rejectBroadProjectPatterns(projectCat, cat);
+		// Baseline = defaults + machine. Machine exclusions of defaults are honoured.
+		const baseline = mergePatterns([def?.[cat], machine?.[cat]]);
+
+		const projectCat = project?.[cat];
+		if (!projectCat) {
+			result[cat] = baseline;
+			continue;
 		}
-		result[cat] = mergePatterns([def?.[cat], machine?.[cat], projectCat]);
+
+		// Apply the project layer, enforcing the immovable-baseline lock.
+		const kept: string[] = [];
+		for (const p of projectCat) {
+			if (p.startsWith("!")) {
+				const target = p.slice(1);
+				// The project layer cannot remove baseline patterns.
+				if (containsIgnoreCase(baseline, target)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer ${cat} command-rules exclusion "${p}" targets a baseline pattern and was ignored. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+					continue;
+				}
+				// Excluding a non-baseline pattern is a silent no-op (matches
+				// mergePatterns behaviour); pass it through unchanged so the
+				// project layer's non-baseline exclusion semantics survive.
+				kept.push(p);
+				continue;
+			}
+
+			// Addition. For safe/moderate, reject overly-broad patterns and
+			// patterns that shadow a baseline dangerous/external pattern.
+			if (cat === "safe" || cat === "moderate") {
+				if (OVERLY_BROAD_COMMAND_PATTERNS.has(p)) {
+					console.error(`[pi-secured-setup] WARNING: Overly broad ${cat} command pattern "${p}" from the project layer was rejected (would classify all commands as ${cat}). The pattern falls back to unknown→confirm.`);
+					continue;
+				}
+				if (containsIgnoreCase(baselineDangerousOrExternal, p)) {
+					console.error(`[pi-secured-setup] WARNING: Project-layer ${cat} command pattern "${p}" shadows a baseline dangerous/external pattern and was rejected. The project layer can strengthen but not weaken the baseline (see ADR-0009).`);
+					continue;
+				}
+			}
+
+			kept.push(p);
+		}
+
+		result[cat] = mergePatterns([baseline, kept]);
 	}
 
 	return result;

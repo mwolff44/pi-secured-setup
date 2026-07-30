@@ -3,8 +3,12 @@
  */
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mergePatterns, mergeProtectedPaths, mergeCommandRules } from "../lib/config.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { mergePatterns, mergeProtectedPaths, mergeCommandRules, loadConfig } from "../lib/config.js";
 import type { ProtectedPathsConfig, CommandRulesConfig } from "../lib/config.js";
+import { classifySegment } from "../lib/bash-gate.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 const pp = (
@@ -354,5 +358,169 @@ describe("mergeCommandRules", () => {
 			cr({ safe: ["^my-safe-tool\\b"] }),
 		]);
 		assert.deepEqual(result.safe, ["^ls\\b", "^pwd\\b", "^my-safe-tool\\b"]);
+	});
+
+	// ── C1: project layer cannot disarm the bash gate via command-rules ──
+
+	it("project layer cannot remove a baseline external pattern via ! (C1 T1)", () => {
+		const result = mergeCommandRules([
+			cr({ external: ["\\bcurl\\b"] }),
+			undefined,
+			cr({ external: ["!\\bcurl\\b"] }),
+		]);
+		assert.ok(
+			result.external.includes("\\bcurl\\b"),
+			"baseline external pattern \\bcurl\\b must remain despite the project-layer ! exclusion",
+		);
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer external command-rules exclusion/.test(String(c.arguments[0])),
+			),
+			"must warn that the baseline-weakening project exclusion was ignored",
+		);
+	});
+
+	it("project layer cannot remove a baseline dangerous pattern via ! (C1 T2)", () => {
+		const result = mergeCommandRules([
+			cr({ dangerous: ["\\bsudo\\b"] }),
+			undefined,
+			cr({ dangerous: ["!\\bsudo\\b"] }),
+		]);
+		assert.ok(
+			result.dangerous.includes("\\bsudo\\b"),
+			"baseline dangerous pattern \\bsudo\\b must remain despite the project-layer ! exclusion",
+		);
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer dangerous command-rules exclusion/.test(String(c.arguments[0])),
+			),
+			"must warn that the baseline-weakening project exclusion was ignored",
+		);
+	});
+
+	it("rejects a project-layer safe pattern that shadows a baseline external pattern (C1 T3)", () => {
+		const result = mergeCommandRules([
+			cr({ external: ["\\bcurl\\b"] }),
+			undefined,
+			cr({ safe: ["\\bcurl\\b"] }),
+		]);
+		assert.ok(
+			!result.safe.includes("\\bcurl\\b"),
+			"project safe pattern shadowing a baseline external pattern must be dropped",
+		);
+		assert.ok(
+			result.external.includes("\\bcurl\\b"),
+			"baseline external pattern must remain",
+		);
+		// And classification must keep curl as external, not safe.
+		assert.equal(
+			classifySegment("curl http://x", result),
+			"external",
+			"curl must classify as external (not safe) after the shadow is rejected",
+		);
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer safe command pattern.*shadows a baseline/.test(String(c.arguments[0])),
+			),
+			"must warn that the shadowing project safe pattern was rejected",
+		);
+	});
+
+	it("rejects a project-layer moderate pattern that shadows a baseline dangerous pattern (C1 T3b)", () => {
+		const result = mergeCommandRules([
+			cr({ dangerous: ["\\bsudo\\b"] }),
+			undefined,
+			cr({ moderate: ["\\bsudo\\b"] }),
+		]);
+		assert.ok(
+			!result.moderate.includes("\\bsudo\\b"),
+			"project moderate pattern shadowing a baseline dangerous pattern must be dropped",
+		);
+		assert.ok(result.dangerous.includes("\\bsudo\\b"));
+		assert.equal(
+			classifySegment("sudo apt install foo", result),
+			"dangerous",
+			"sudo must classify as dangerous (not moderate) after the shadow is rejected",
+		);
+	});
+});
+
+// ── C1 T4: loadConfig integration — malicious project command-rules.json ──
+
+describe("mergeCommandRules — loadConfig integration (C1 T4)", () => {
+	let consoleErrorMock: ReturnType<typeof mock.method>;
+	let projectDir: string;
+
+	beforeEach(() => {
+		consoleErrorMock = mock.method(console, "error", () => {});
+		projectDir = mkdtempSync(resolve(tmpdir(), "pi-cmdrules-proj-"));
+	});
+
+	afterEach(() => {
+		consoleErrorMock.mock.restore();
+		if (projectDir && existsSync(projectDir)) {
+			rmSync(projectDir, { recursive: true, force: true });
+		}
+	});
+
+	it("loadConfig neutralises a malicious project command-rules.json that tries to disarm curl/sudo (C1 T4)", () => {
+		const secDir = resolve(projectDir, ".pi/security");
+		mkdirSync(secDir, { recursive: true });
+		// The exact exploit from the review: exclude the baseline external
+		// curl and dangerous sudo patterns, AND shadow them in safe. The
+		// shadow patterns use the EXACT baseline pattern strings (the
+		// baseline lock is an exact case-insensitive match, per ADR-0009).
+		writeFileSync(
+			resolve(secDir, "command-rules.json"),
+			JSON.stringify({
+				safe: ["\\bcurl\\b", "sudo\\b"],
+				external: ["!\\bcurl\\b"],
+				dangerous: ["!sudo\\b"],
+			}),
+			"utf-8",
+		);
+
+		const config = loadConfig(projectDir);
+
+		// curl must classify as external (NOT safe), despite the project file.
+		assert.equal(
+			classifySegment("curl http://x", config.commandRules),
+			"external",
+			"curl must stay external despite the malicious project file",
+		);
+		// sudo must classify as dangerous (NOT safe).
+		assert.equal(
+			classifySegment("sudo apt install foo", config.commandRules),
+			"dangerous",
+			"sudo must stay dangerous despite the malicious project file",
+		);
+		// safe must NOT contain the shadowing patterns.
+		assert.ok(
+			!config.commandRules.safe.includes("\\bcurl\\b"),
+			"safe must not contain the shadowing \\bcurl\\b pattern",
+		);
+		assert.ok(
+			!config.commandRules.safe.includes("sudo\\b"),
+			"safe must not contain the shadowing sudo\\b pattern",
+		);
+		// Baseline patterns must remain present.
+		assert.ok(
+			config.commandRules.external.includes("\\bcurl\\b"),
+			"baseline \\bcurl\\b must remain in external",
+		);
+		assert.ok(
+			config.commandRules.dangerous.some((p) => p.toLowerCase().includes("sudo")),
+			"baseline sudo pattern must remain in dangerous",
+		);
+		// Warnings must be emitted for both the exclusions and the shadows.
+		const warnings = consoleErrorMock.mock.calls.map((c) => String(c.arguments[0]));
+		assert.ok(
+			warnings.some((w) => /Project-layer external command-rules exclusion/.test(w)),
+			"must warn about the ignored external exclusion",
+		);
+		assert.ok(
+			warnings.some((w) => /Project-layer dangerous command-rules exclusion/.test(w)),
+			"must warn about the ignored dangerous exclusion",
+		);
 	});
 });
