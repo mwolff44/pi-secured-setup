@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-30
+
+### Added
+- OWASP AI Agent Security hardening: 13 gaps remediated against the OWASP AI Agent Security Cheat Sheet
+- HMAC-SHA256 forward-chained audit log with machine-local `audit.key` (0o600) and `/security:verify` tamper-evidence command
+- Bash exfiltration detection: secrets in commands, data-carrying query parameters, large base64 blobs, command substitution, pipe-based exfil, cloud CLIs (aws/gcloud/docker), and process substitution `<(...)`
+- Symlink-aware boundary enforcement via `realpath` with fail-closed semantics for broken symlinks (ADR-0005)
+- Rate limiting: per-turn `tool_calls` and per-session `confirmations` caps with `ratelimit.block` audit events
+- Prompt-injection heuristic scanner (wraps `[UNTRUSTED CONTENT]`, surfaces findings at skill approval, never blocks)
+- Token/anomaly metrics scanner (`turn.metrics` + `anomaly` audit events)
+- Tool-input shape validation (fail-closed for malformed inputs)
+- `ctx.mode` gating: non-TUI modes fail closed for any action requiring confirmation
+- Bash tokenizer hardened: heredocs, process substitution, brace expansion
+- CI workflow: `test` + `typecheck` + two-tier `npm audit` (critical blocks, high advisory) + CycloneDX SBOM
+- Dependabot config for npm and GitHub Actions
+- 6 new ADRs (0005–0010)
+- Integration, fuzz, and rotation test suites; coverage gate at 86% (lib/ measured 90.33%)
+
+### Fixed
+- Config baseline lock extended to all command-rules categories — the project layer can no longer disarm the bash Guard via `!` exclusions or `safe` shadowing of baseline `dangerous`/`external` patterns (C1)
+- Audit truncation/deletion detection: `/security:verify` now flags a missing or empty active `audit.jsonl` when rotated files exist (H1)
+- Protected-paths matching now resolves symlink real targets, not just lexical paths (M1)
+- Secret scanner now redacts secrets on comment lines by default — commented-out credentials no longer reach the LLM (M1)
+- Timing-safe hash comparison in `verifyFile` via `crypto.timingSafeEqual` (N1)
+- Process-substitution `<(...)` exfiltration now detected by `detectExfiltration` (N4)
+- Rotation-sequence gap detection in `verifyAuditChain` for deleted middle files (R9)
+- HMAC key length enforced (≥32 bytes, else regenerate) (R8)
+- `/security:clean` re-seals the HMAC chain instead of breaking it (R2)
+- Project-layer scalar `writeAction`/`readAction` clamped to baseline restrictiveness (R3)
+- Secrets redacted in the bash confirm dialog message (R5)
+- `strict:true` enabled in tsconfig (16 type errors → 0, no suppressions) (R6)
+- Two-tier `npm audit` gate in CI (critical blocks, high advisory) (R7)
+- Removed unused `audit_writes` rate-limit scope (R1)
+- Dead import removed; `noUnusedLocals` enabled in tsconfig (L1)
+
+### Changed
+- Bumped peer dependencies `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` from `^0.82.1` to `^0.83.0`
+- Bumped `protobufjs` override to `^7.6.5` (GHSA-j3f2-48v5-ccww)
+- Bumped `tsx` dev dependency to `4.23.1`
+- Bumped GitHub Actions to v7: `actions/checkout`, `actions/setup-node`, `actions/upload-artifact`
+- Audit chain state cached between writes (O(n)→O(1) per event) (L2)
+- Classification regexes precompiled and memoised per rules object (L3)
+
+### Security
+- Resolved the last open Dependabot alert: `protobufjs` 7.6.4 → 7.6.5 (CVE-2026-59877, DoS via infinite loop in `.proto` option parsing)
+- All 14 Dependabot advisories now closed (undici, ws, protobufjs, brace-expansion)
+
+### Notes
+- No breaking API changes; the new `Config` fields are optional with shipped defaults.
+- Encryption-at-rest and multi-agent security remain explicitly out of scope (documented in ADR-0007/0008).
+
 ## [1.0.4] - 2026-07-28
 
 ### Changed
