@@ -8,7 +8,7 @@
  * Read from protected path → confirm (configurable)
  */
 import type { Config } from "./config.js";
-import { resolvePath } from "./utils.js";
+import { resolvePath, resolveRealPath, BrokenSymlinkError } from "./utils.js";
 import type { GuardVerdict } from "./boundary.js";
 
 /**
@@ -71,19 +71,42 @@ export function evaluateProtectedPaths(
 	const targetPath = resolvePath(config.cwd, rawPath);
 	const patterns = config.protectedPaths.patterns;
 
-	// Check against all merged patterns
+	// Defense-in-depth (M1 Weft): a symlink inside the boundary may point at
+	// a real target whose name matches a protected pattern even though the
+	// symlink's lexical name does not. Resolve the real target and match
+	// against BOTH the lexical path and the real path. Broken symlinks fall
+	// back to the lexical path (the boundary layer applies fail-closed
+	// semantics for writes; here we keep the lexical match so an
+	// intentional-but-unresolved path still matches by intent).
+	let realTarget: string = targetPath;
+	try {
+		realTarget = resolveRealPath(targetPath);
+	} catch (err) {
+		if (err instanceof BrokenSymlinkError) {
+			realTarget = targetPath; // lexical fallback for broken symlinks
+		} else {
+			realTarget = targetPath;
+		}
+	}
+
+	const candidatePaths = realTarget === targetPath ? [targetPath] : [targetPath, realTarget];
+
+	// Check against all merged patterns.
 	let matched = false;
 	for (const pattern of patterns) {
-		if (matchGlob(pattern, targetPath)) {
-			matched = true;
-			break;
+		for (const candidate of candidatePaths) {
+			if (matchGlob(pattern, candidate)) {
+				matched = true;
+				break;
+			}
+			// Also try matching against the basename.
+			const basename = candidate.split("/").pop() ?? "";
+			if (matchGlob(pattern, basename)) {
+				matched = true;
+				break;
+			}
 		}
-		// Also try matching against the basename
-		const basename = targetPath.split("/").pop() ?? "";
-		if (matchGlob(pattern, basename)) {
-			matched = true;
-			break;
-		}
+		if (matched) break;
 	}
 
 	if (!matched) return { action: "allow" };
