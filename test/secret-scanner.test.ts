@@ -113,10 +113,14 @@ describe("redactString", () => {
 		assert.ok(result.includes("***REDACTED:password***"));
 	});
 
-	it("skips single-line comment strings", () => {
+	it("redacts secrets on single-line comment strings by default (M1 Warp)", () => {
+		// Commented-out credentials are extremely common in config files the
+		// agent reads (# API_KEY=sk-ant-..., // password=hunter2). They must
+		// not reach the LLM in plaintext. Comment-skipping is a display
+		// concern, not a redaction concern (see M1 finding).
 		const { result, redactions } = redactString("# password=\"supersecret123\"");
-		assert.equal(redactions.length, 0);
-		assert.equal(result, "# password=\"supersecret123\"");
+		assert.ok(redactions.length > 0, "should redact secret on comment line by default");
+		assert.ok(result.includes("***REDACTED:password***"), "secret must be redacted");
 	});
 
 	it("redacts secrets on non-comment lines in multi-line strings", () => {
@@ -196,11 +200,23 @@ describe("redactString", () => {
 		assert.ok(result.includes("***REDACTED:password***"));
 	});
 
-	it("skips comment lines by default for backward compatibility", () => {
+	it("redacts secrets on comment lines by default (M1 Warp)", () => {
+		// The old default (skipCommentLines: true) leaked commented-out
+		// secrets to the LLM. The default is now false so commented
+		// credentials are redacted. Callers may still opt out explicitly.
 		const input = "# password=MyS3cret123";
 		const { result, redactions } = redactString(input);
-		assert.equal(redactions.length, 0, "should skip comment line by default");
-		assert.equal(result, input);
+		assert.ok(redactions.length > 0, "should redact secret on comment line by default");
+		assert.ok(result.includes("***REDACTED:password***"));
+	});
+
+	it("redacts commented-out AWS key in a .env-style line (M1 Warp)", () => {
+		// Exact scenario from the Warp finding: a commented production key
+		// in a config file the agent reads must not reach the LLM.
+		const input = "# AWS_KEY=AKIAIOSFODNN7EXAMPLE";
+		const { result, redactions } = redactString(input);
+		assert.ok(redactions.length > 0, "commented AWS key must be redacted");
+		assert.ok(result.includes("***REDACTED:aws-access-key***"));
 	});
 });
 

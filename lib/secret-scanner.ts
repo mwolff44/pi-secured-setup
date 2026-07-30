@@ -227,12 +227,16 @@ export function findSecrets(text: string): { patternName: string }[] {
  * Scan and redact secrets from a string value.
  * First redacts multi-line PEM private key blocks as a whole,
  * then processes remaining content line-by-line.
- * Only individual comment lines are skipped; non-comment lines
- * have secrets redacted normally.
+ *
+ * Comment lines are scanned by default (M1): commented-out credentials
+ * (`# API_KEY=sk-ant-...`, `// password=hunter2`) are common in config
+ * files the agent reads and must not reach the LLM in plaintext. Pass
+ * `{ skipCommentLines: true }` to restore the legacy display-only skip
+ * (used by callers that want to preserve comment content verbatim).
  * Returns the redacted string and a list of redactions performed.
  */
 export function redactString(value: string, options: RedactOptions = {}): { result: string; redactions: Redaction[] } {
-	const skipComments = options.skipCommentLines !== false;
+	const skipComments = options.skipCommentLines === true;
 
 	// Step 1: Redact multi-line PEM blocks before line-by-line processing
 	const { result: pemRedacted, redactions: pemRedactions } = redactPEMBlocks(value);
