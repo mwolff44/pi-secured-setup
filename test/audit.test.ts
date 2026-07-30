@@ -681,6 +681,161 @@ describe("audit rotation-sequence gap detection (R9)", () => {
 	});
 });
 
+// ── H1: truncation/deletion of the active audit.jsonl ──────────────────
+//
+// `/security:verify` walks each rotated file from GENESIS and the current
+// file. Previously an attacker who truncated or deleted ONLY the active
+// `audit.jsonl` (leaving rotated `.N` files intact) erased the most recent
+// evidence undetected — verify returned `{ ok: true, entries: 0 }` for the
+// empty/missing current file. A missing-or-empty current file when rotated
+// files exist is strong evidence of erasure, so verify now flags it.
+
+describe("audit active-file truncation/deletion detection (H1)", () => {
+	let tempDir: string;
+	let auditFile: string;
+	let keyPath: string;
+	let previousAuditFile: string;
+
+	beforeEach(() => {
+		tempDir = resolve(tmpdir(), `pi-audit-h1-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		auditFile = resolve(tempDir, "audit.jsonl");
+		keyPath = resolve(tempDir, "audit.key");
+		previousAuditFile = _setAuditFileForTest(auditFile);
+		initAuditLog();
+	});
+
+	afterEach(() => {
+		_setAuditFileForTest(previousAuditFile);
+		if (tempDir && existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	/** Trigger audit.key generation by writing one real chained entry. */
+	function ensureKey(): void {
+		auditLog("test.bootstrap", "info", { ok: true });
+		assert.ok(existsSync(keyPath), "audit.key must exist after bootstrap");
+	}
+
+	/** Read the audit.key from the temp dir as a Buffer. */
+	function loadKey(): Buffer {
+		assert.ok(existsSync(keyPath), "audit.key must exist; call ensureKey() first");
+		return readFileSync(keyPath);
+	}
+
+	/** Write a valid independently-chained rotated file sealed with audit.roll. */
+	function seedRotated(n: number, bodies: AuditEntry[]): void {
+		const key = loadKey();
+		const withRoll: AuditEntry[] = [
+			...bodies,
+			{
+				timestamp: new Date().toISOString(),
+				sessionId: "seed-session",
+				type: "audit.roll",
+				severity: "info",
+				details: { reason: "size-threshold" },
+			},
+		];
+		const chained = rechainEntries(withRoll, key);
+		writeFileSync(
+			`${auditFile}.${n}`,
+			chained.map((e) => JSON.stringify(e)).join("\n") + "\n",
+			"utf-8",
+		);
+	}
+
+	function body(idx: number): AuditEntry {
+		return {
+			timestamp: new Date().toISOString(),
+			sessionId: "seed-session",
+			type: "test.event",
+			severity: "info",
+			details: { idx },
+		};
+	}
+
+	it("flags an empty current audit file when rotated files exist (H1 T5)", () => {
+		ensureKey();
+		seedRotated(1, [body(1), body(2)]);
+
+		// Attacker truncates the current file to empty.
+		writeFileSync(auditFile, "", "utf-8");
+		assert.equal(statSync(auditFile).size, 0, "precondition: current file is empty");
+
+		const results = verifyAuditChain();
+
+		const current = results.find((r) => r.file === auditFile);
+		assert.ok(current, "result must include a finding for the current file");
+		assert.equal(current!.ok, false, "empty current file must NOT verify when rotated files exist");
+		assert.equal(current!.entries, 0);
+		assert.match(
+			current!.reason ?? "",
+			/truncation|empty/i,
+			`reason must mention truncation/empty: ${current!.reason}`,
+		);
+		// The rotated .1 file must still verify OK on its own.
+		const dot1 = results.find((r) => r.file === `${auditFile}.1`);
+		assert.ok(dot1, "result must include the .1 rotated file");
+		assert.equal(dot1!.ok, true, `.1 should still verify: ${dot1!.reason}`);
+	});
+
+	it("flags a missing current audit file when rotated files exist (H1 T6)", () => {
+		ensureKey();
+		seedRotated(1, [body(1), body(2)]);
+
+		// Attacker deletes the current file.
+		if (existsSync(auditFile)) unlinkSync(auditFile);
+		assert.ok(!existsSync(auditFile), "precondition: current file is missing");
+
+		const results = verifyAuditChain();
+
+		const current = results.find((r) => r.file === auditFile);
+		assert.ok(current, "result must include a finding for the current file");
+		assert.equal(current!.ok, false, "missing current file must NOT verify when rotated files exist");
+		assert.match(
+			current!.reason ?? "",
+			/missing|deletion/i,
+			`reason must mention missing/deletion: ${current!.reason}`,
+		);
+		// The rotated .1 file must still verify OK on its own.
+		const dot1 = results.find((r) => r.file === `${auditFile}.1`);
+		assert.ok(dot1, "result must include the .1 rotated file");
+		assert.equal(dot1!.ok, true, `.1 should still verify: ${dot1!.reason}`);
+	});
+
+	it("a fresh session with no audit file and no rotated files verifies clean (H1 T7)", () => {
+		// Do NOT bootstrap: no current file, no rotated files. This is the
+		// first-run state. The new truncation/deletion branches are gated on
+		// `maxPresent > 0`, so they must NOT fire here (no false positive).
+		assert.ok(!existsSync(auditFile), "precondition: no current audit file");
+		assert.ok(!existsSync(`${auditFile}.1`), "precondition: no rotated files");
+
+		const results = verifyAuditChain();
+		// Either an empty result set, or every finding is ok.
+		assert.ok(
+			results.every((r) => r.ok),
+			`fresh session must verify clean (no false positive): ${JSON.stringify(results)}`,
+		);
+	});
+
+	it("an empty current file with NO rotated files still verifies clean (H1 T7b)", () => {
+		// ensureLogExists creates an empty current file on first write, but
+		// here we just create an empty file directly to model a freshly-touched
+		// (never-written) current file with no rotated files. Must be ok.
+		ensureKey(); // generates the key but also writes one entry...
+		// Overwrite with empty to model an empty-but-present current file.
+		writeFileSync(auditFile, "", "utf-8");
+		assert.equal(statSync(auditFile).size, 0);
+		assert.ok(!existsSync(`${auditFile}.1`), "precondition: no rotated files");
+
+		const results = verifyAuditChain();
+		const current = results.find((r) => r.file === auditFile);
+		assert.ok(current, "current file must appear in the result");
+		assert.equal(current!.ok, true, "empty current file with no rotated files must verify OK");
+	});
+});
+
 // ── Rotation: maybeRotate multi-file + overflow + audit.roll seal ─────
 //
 // `maybeRotate` reads `audit-config.json` from MACHINE_CONFIG_DIR (the

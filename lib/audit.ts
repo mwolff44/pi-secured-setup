@@ -691,8 +691,17 @@ export interface FileVerification {
  *
  * Each file starts from `prevHash = "GENESIS"` (files are independently
  * verifiable; `audit.roll` is the logical end-of-file marker).
+ *
+ * @param file              — Path to the file to verify.
+ * @param key               — HMAC key (null ⇒ cannot verify chained entries).
+ * @param rotatedFilesExist — When true, an empty file is treated as
+ *   evidence of truncation and reported as `ok:false` (see H1). Used for
+ *   the active `audit.jsonl` when rotated `.N` files are present: an empty
+ *   current file alongside non-empty rotated files is strong evidence of
+ *   erasure. Defaults to `false` so existing call sites (rotated-file
+ *   verification) keep their benign-empty-file semantics.
  */
-function verifyFile(file: string, key: Buffer | null): FileVerification {
+function verifyFile(file: string, key: Buffer | null, rotatedFilesExist = false): FileVerification {
 	if (!existsSync(file)) {
 		return { file, ok: true, entries: 0 };
 	}
@@ -710,7 +719,17 @@ function verifyFile(file: string, key: Buffer | null): FileVerification {
 	}
 
 	const trimmed = content.trim();
-	if (!trimmed) return { file, ok: true, entries: 0 };
+	if (!trimmed) {
+		if (rotatedFilesExist) {
+			return {
+				file,
+				ok: false,
+				entries: 0,
+				reason: "current audit file is empty but rotated files exist — possible truncation",
+			};
+		}
+		return { file, ok: true, entries: 0 };
+	}
 
 	const lines = trimmed.split("\n");
 	let prevHash = GENESIS_HASH;
@@ -858,8 +877,21 @@ export function verifyAuditChain(): FileVerification[] {
 			});
 		}
 	}
+	// Active-file truncation/deletion detection (H1): an empty or missing
+	// current file when rotated `.N` files exist is strong evidence of
+	// erasure of the most recent evidence. `verifyFile` flags the empty
+	// case when `rotatedFilesExist` is true; the missing case is flagged
+	// here. With no rotated files, a missing/empty current file is the
+	// normal first-run state and must NOT be flagged (T7/T7b guards).
 	if (existsSync(_auditFile)) {
-		results.push(verifyFile(_auditFile, key));
+		results.push(verifyFile(_auditFile, key, maxPresent > 0));
+	} else if (maxPresent > 0) {
+		results.push({
+			file: _auditFile,
+			ok: false,
+			entries: 0,
+			reason: "current audit file missing but rotated files exist — possible deletion",
+		});
 	}
 
 	return results;
