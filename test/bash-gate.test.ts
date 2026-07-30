@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { classifyCommand, classifySegment, splitCommand, detectExfiltration, containsBraceExpansion } from "../lib/bash-gate.js";
+import { classifyCommand, classifySegment, splitCommand, detectExfiltration, containsBraceExpansion, _compiledRegexesForTest } from "../lib/bash-gate.js";
 import { findSecrets, redactString } from "../lib/secret-scanner.js";
 import type { Config } from "../lib/config.js";
 
@@ -759,11 +759,83 @@ describe("bash adversarial corpus (test/fixtures/bash-adversarial.json)", () => 
 			}
 
 			if (tc.mustNotContainSegment !== undefined) {
-				assert.ok(
-					!parts.some((p) => p.includes(tc.mustNotContainSegment!)),
-					`${tc.id}: did not expect a segment containing '${tc.mustNotContainSegment}', got ${JSON.stringify(parts)}`,
-				);
-			}
-		});
+			assert.ok(
+				!parts.some((p) => p.includes(tc.mustNotContainSegment!)),
+				`${tc.id}: did not expect a segment containing '${tc.mustNotContainSegment}', got ${JSON.stringify(parts)}`,
+			);
+		}
+	});
 	}
+});
+
+// ── L3: regex compilation cache ────────────────────────────────────────
+//
+// `classifySegment` previously built a fresh `new RegExp(pattern, "i")` for
+// every pattern on every call, recompiling the whole rule set on each bash
+// classification. The compiled regexes are now memoised per rules object so
+// repeat classifications reuse them. This test asserts the cache returns the
+// SAME RegExp instances across calls with the same rules (identity), and
+// fresh instances when the rules object changes.
+
+describe("classifySegment — regex compilation cache (L3)", () => {
+	function rules(
+		overrides: Partial<Record<"safe" | "moderate" | "dangerous" | "external", string[]>> = {},
+	): Record<"safe" | "moderate" | "dangerous" | "external", string[]> {
+		return {
+			safe: ["^ls\\b", "^cat\\b"],
+			moderate: ["^npm\\b"],
+			dangerous: ["rm\\b"],
+			external: ["\\bcurl\\b"],
+			...overrides,
+		};
+	}
+
+	it("reuses compiled regexes across calls with the same rules (L3 T13)", () => {
+		const r = rules();
+		classifySegment("ls -la", r);
+		const first = _compiledRegexesForTest(r);
+		assert.ok(first, "precondition: rules must be cached after a classification");
+		assert.equal(first.safe.length, 2, "safe compiled patterns");
+		assert.equal(first.external.length, 1, "external compiled patterns");
+
+		classifySegment("curl http://x", r);
+		const second = _compiledRegexesForTest(r);
+		assert.ok(second);
+		// Identity: the exact same RegExp record AND individual regexes are
+		// reused, proving no recompilation occurred.
+		assert.equal(second, first, "compiled regex record must be reused (cached), not rebuilt");
+		assert.equal(
+			second.safe[0],
+			first.safe[0],
+			"individual regexes must be the same instance (no recompilation)",
+		);
+		assert.equal(second.external[0], first.external[0]);
+	});
+
+	it("recompiles when the rules object identity changes (L3 T13b)", () => {
+		const rA = rules();
+		const rB = rules(); // same content, different object identity
+		classifySegment("ls", rA);
+		const a = _compiledRegexesForTest(rA);
+		classifySegment("ls", rB);
+		const b = _compiledRegexesForTest(rB);
+		assert.ok(a && b);
+		assert.notEqual(a, b, "different rules objects must produce distinct cache entries");
+		assert.notEqual(
+			a.safe[0],
+			b.safe[0],
+			"different rules objects must compile fresh regex instances",
+		);
+	});
+
+	it("skips invalid regex patterns during compilation (L3 T13c)", () => {
+		const r = rules({ safe: ["^ls\\b", "(unclosed"] }); // `(unclosed` is invalid
+		// Invalid patterns must not throw; valid ones must still match.
+		assert.doesNotThrow(() => classifySegment("ls", r));
+		assert.equal(classifySegment("ls -la", r), "safe");
+		const compiled = _compiledRegexesForTest(r);
+		assert.ok(compiled);
+		// Only the valid pattern compiled; the invalid one was skipped.
+		assert.equal(compiled.safe.length, 1, "invalid regex must be skipped, valid one kept");
+	});
 });

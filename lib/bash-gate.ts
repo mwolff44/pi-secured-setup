@@ -165,19 +165,71 @@ export function detectExfiltration(command: string): ExfilFinding[] {
 }
 
 /**
+ * Compile a list of command-rule patterns into RegExp instances, skipping
+ * patterns that are not valid regex. Compiled with the case-insensitive
+ * flag to match the original `new RegExp(pattern, "i")` semantics.
+ */
+function compilePatterns(patterns: string[]): RegExp[] {
+	const compiled: RegExp[] = [];
+	for (const pattern of patterns) {
+		try {
+			compiled.push(new RegExp(pattern, "i"));
+		} catch {
+			// Skip invalid regex patterns (preserves prior behaviour).
+		}
+	}
+	return compiled;
+}
+
+/**
+ * L3: memoised compilation cache. Keyed by the rules object identity (a
+ * `WeakMap` so a reloaded config's old rules object is garbage-collected).
+ * `config.commandRules` is stable across calls within a session, so repeat
+ * classifications reuse the compiled regexes instead of recompiling the
+ * whole rule set on every call. Recompiles only when the rules object
+ * identity changes (e.g. `loadConfig` on a new session).
+ */
+const _regexCache = new WeakMap<Record<CommandCategory, string[]>, Record<CommandCategory, RegExp[]>>();
+
+function getCompiledRules(rules: Record<CommandCategory, string[]>): Record<CommandCategory, RegExp[]> {
+	let compiled = _regexCache.get(rules);
+	if (!compiled) {
+		compiled = {
+			safe: compilePatterns(rules.safe),
+			moderate: compilePatterns(rules.moderate),
+			dangerous: compilePatterns(rules.dangerous),
+			external: compilePatterns(rules.external),
+		};
+		_regexCache.set(rules, compiled);
+	}
+	return compiled;
+}
+
+/**
+ * Test-only: return the cached compiled regexes for a given rules object,
+ * or `undefined` if not yet compiled. Lets the L3 test assert that repeat
+ * `classifySegment` calls reuse the SAME RegExp instances (identity) rather
+ * than recompiling.
+ */
+export function _compiledRegexesForTest(
+	rules: Record<CommandCategory, string[]>,
+): Record<CommandCategory, RegExp[]> | undefined {
+	return _regexCache.get(rules);
+}
+
+/**
  * Classify a single command segment against the rule patterns.
+ *
+ * Compiled regexes are memoised per rules object (L3): repeat calls with the
+ * same `rules` reference reuse the cached `RegExp` instances instead of
+ * recompiling.
  */
 export function classifySegment(command: string, rules: Record<CommandCategory, string[]>): CommandCategory | null {
+	const compiled = getCompiledRules(rules);
 	for (const category of CATEGORY_PRIORITY) {
-		const patterns = rules[category];
-		for (const pattern of patterns) {
-			try {
-				const regex = new RegExp(pattern, "i");
-				if (regex.test(command)) {
-					return category;
-				}
-			} catch {
-				// Skip invalid regex patterns
+		for (const regex of compiled[category]) {
+			if (regex.test(command)) {
+				return category;
 			}
 		}
 	}
