@@ -22,7 +22,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { resolve, dirname } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { Config } from "./config.js";
 import { MACHINE_CONFIG_DIR, generateSessionId, sha256, hmacSha256 } from "./utils.js";
 
@@ -739,6 +739,21 @@ export function aggregateSessionMetrics(): SessionMetrics {
 
 // ── Chain verification (ADR-0007) ─────────────────────────────────────
 
+/**
+ * Constant-time string equality for MAC/hash verification (N1).
+ *
+ * `!==` on hash strings is practically unexploitable here (the attacker has
+ * no oracle: forging a candidate hash requires the HMAC key, which is not
+ * the value being compared), but `timingSafeEqual` is the canonical pattern
+ * for MAC verification and hardens the "tamper-evident" claim on principle.
+ * Length mismatch short-circuits to `false` (the lengths themselves are not
+ * secret — they are SHA-256 hex digests of fixed length).
+ */
+function safeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	return timingSafeEqual(Buffer.from(a, "utf-8"), Buffer.from(b, "utf-8"));
+}
+
 export interface FileVerification {
 	file: string;
 	ok: boolean;
@@ -835,16 +850,16 @@ function verifyFile(file: string, key: Buffer | null, rotatedFilesExist = false)
 					reason: "audit key unavailable — cannot verify",
 				};
 			}
-			if (entry.prevHash !== prevHash) {
-				return {
-					file,
-					ok: false,
-					entries,
-					brokenAtSeq: entry.seq,
-					brokenAtIndex: i,
-					reason: `chain link broken: prevHash does not match preceding entry`,
-				};
-			}
+		if (!safeEqual(entry.prevHash as string, prevHash)) {
+			return {
+				file,
+				ok: false,
+				entries,
+				brokenAtSeq: entry.seq,
+				brokenAtIndex: i,
+				reason: `chain link broken: prevHash does not match preceding entry`,
+			};
+		}
 			if (entry.seq !== expectedSeq) {
 				return {
 					file,
@@ -855,17 +870,17 @@ function verifyFile(file: string, key: Buffer | null, rotatedFilesExist = false)
 					reason: `seq mismatch: expected ${expectedSeq}, got ${entry.seq}`,
 				};
 			}
-			const expected = computeEntryHash(entry, key, entry.prevHash as string);
-			if (entry.hash !== expected) {
-				return {
-					file,
-					ok: false,
-					entries,
-					brokenAtSeq: entry.seq,
-					brokenAtIndex: i,
-					reason: "hash mismatch — entry modified or forged",
-				};
-			}
+		const expected = computeEntryHash(entry, key, entry.prevHash as string);
+		if (!safeEqual(entry.hash as string, expected)) {
+			return {
+				file,
+				ok: false,
+				entries,
+				brokenAtSeq: entry.seq,
+				brokenAtIndex: i,
+				reason: "hash mismatch — entry modified or forged",
+			};
+		}
 			prevHash = entry.hash as string;
 			expectedSeq = (entry.seq as number) + 1;
 		} else if (key) {
