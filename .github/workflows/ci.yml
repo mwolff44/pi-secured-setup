@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
@@ -60,7 +60,7 @@ jobs:
     needs: install
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
@@ -91,7 +91,7 @@ jobs:
     # design change shrinks the reachable surface, and document why.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
@@ -115,7 +115,7 @@ jobs:
     # `{ action: "block"; reason: string } | null`.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
@@ -141,7 +141,7 @@ jobs:
     #      we surface them in the run log without blocking PRs.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
@@ -171,7 +171,7 @@ jobs:
     needs: install
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
