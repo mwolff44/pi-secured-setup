@@ -87,6 +87,16 @@ const FILE_READ_WITH_PATH =
 	/\b(?:cat|head|tail|od|hexdump|base64|xxd|awk|sed|perl|python3|python|ruby|dd|tar|zip)\b[^|]*?(?:\/|~|\.\w)/i;
 
 /**
+ * Process substitution (`<(...)`) that reads file contents.
+ * `curl --data @<(cat .env)`, `wget --post-file=<(base64 ~/.ssh/id_rsa)`.
+ * Distinct from `$(...)` command substitution and `$(< file)` redirection:
+ * process substitution spawns a subprocess whose stdout is wired to a
+ * /dev/fd/N path consumed by the external command. See N4.
+ */
+const PROCESS_SUBSTITUTION_READING_FILES =
+	/<\(\s*(?:cat|head|tail|od|hexdump|base64|xxd|awk|sed|perl|python3|python|ruby|tee|dd|tar|zip)\s+/i;
+
+/**
  * Detect exfiltration indicators in a bash command string.
  *
  * Returns one {@link ExfilFinding} per distinct indicator. Does NOT redact —
@@ -138,6 +148,12 @@ export function detectExfiltration(command: string): ExfilFinding[] {
 			findings.push({
 				kind: "exfil",
 				detail: "command substitution reading files feeds external command",
+			});
+		} else if (PROCESS_SUBSTITUTION_READING_FILES.test(command)) {
+			// Process substitution <(cat .env) feeding an external command (N4).
+			findings.push({
+				kind: "exfil",
+				detail: "process substitution reading files feeds external command",
 			});
 		}
 	}
