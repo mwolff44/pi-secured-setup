@@ -3,11 +3,12 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { evaluateProtectedPaths, matchGlob } from "../lib/protected-paths.js";
-import type { Config } from "../lib/config.js";
+import type { Config, ProtectedPathsConfig } from "../lib/config.js";
+import { DEFAULTS_DIR } from "../lib/utils.js";
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
 	return {
@@ -262,5 +263,173 @@ describe("evaluateProtectedPaths — symlink real-target matching (M1 Weft)", ()
 
 		const result = evaluateProtectedPaths("write", { path: "./link" }, config);
 		assert.equal(result.action, "block", "write via symlink to protected real target must block");
+	});
+});
+
+// ── Defaults false-positive regression (ADR-0011) ─────────────────────
+//
+// Loads the REAL shipped defaults/protected-paths.json so a regression
+// (e.g. re-adding a broad `*secret*`/`*credential*` pattern) is caught by
+// the test suite rather than only by an integration smoke test.
+
+function loadDefaultsConfig(cwd: string): Config {
+	const raw = readFileSync(resolve(DEFAULTS_DIR, "protected-paths.json"), "utf-8");
+	const pp = JSON.parse(raw) as ProtectedPathsConfig;
+	return {
+		cwd,
+		protectedPaths: pp,
+		commandRules: { safe: [], moderate: [], dangerous: [], external: [] },
+		allowedExternal: { paths: [] },
+		audit: { maxFileSize: 10_000_000, maxFiles: 3 },
+		injection: { patterns: [], threshold: 3 },
+	};
+}
+
+describe("defaults/protected-paths.json — false-positive regression (ADR-0011)", () => {
+	const CWD = "/home/user/project";
+
+	const sourceFiles = [
+		"credentials.go",
+		"credential.go",
+		"secret.go",
+		"token.go",
+		"credentials.ts",
+		"credentials.test.ts",
+	];
+
+	const sensitiveFiles = [
+		".env",
+		".env.production",
+		"server.key",
+		"certificate.pem",
+		"oauth-credentials.json",
+		"service-credentials.yaml",
+		"api-token.json",
+		"secrets.json",
+	];
+
+	describe("source files named credentials/secret/token remain editable", () => {
+		for (const file of sourceFiles) {
+			it(`allows write to ${file}`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("write", { path: file }, config);
+				assert.equal(result.action, "allow", `${file} must not match a default protected pattern`);
+			});
+
+			it(`allows edit to ${file}`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("edit", { path: file }, config);
+				assert.equal(result.action, "allow", `${file} must not match a default protected pattern`);
+			});
+
+			it(`allows read from ${file}`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("read", { path: file }, config);
+				assert.equal(result.action, "allow", `${file} must not match a default protected pattern`);
+			});
+		}
+	});
+
+	describe("sensitive structured files remain protected", () => {
+		for (const file of sensitiveFiles) {
+			it(`blocks write to ${file}`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("write", { path: file }, config);
+				assert.equal(result.action, "block", `${file} must match a default protected pattern`);
+			});
+
+			it(`blocks edit to ${file}`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("edit", { path: file }, config);
+				assert.equal(result.action, "block", `${file} must match a default protected pattern`);
+			});
+
+			it(`confirms read from ${file} (default readAction)`, () => {
+				const config = loadDefaultsConfig(CWD);
+				const result = evaluateProtectedPaths("read", { path: file }, config);
+				assert.equal(result.action, "confirm", `${file} must match a default protected pattern`);
+			});
+		}
+	});
+
+	describe("matching variants — basename, subdirectory, absolute path", () => {
+		it("allows write to credentials.go by basename only", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: "credentials.go" }, config);
+			assert.equal(result.action, "allow");
+		});
+
+		it("allows write to credentials.go inside a subdirectory", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: "src/credentials.go" }, config);
+			assert.equal(result.action, "allow");
+		});
+
+		it("allows write to credentials.go via absolute path under cwd", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: `${CWD}/credentials.go` }, config);
+			assert.equal(result.action, "allow");
+		});
+
+		it("blocks write to oauth-credentials.json by basename only", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: "oauth-credentials.json" }, config);
+			assert.equal(result.action, "block");
+		});
+
+		it("blocks write to oauth-credentials.json inside a subdirectory", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: "config/oauth-credentials.json" }, config);
+			assert.equal(result.action, "block");
+		});
+
+		it("blocks write to oauth-credentials.json via absolute path under cwd", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: `${CWD}/oauth-credentials.json` }, config);
+			assert.equal(result.action, "block");
+		});
+
+		it("blocks write to secrets.json inside a nested subdirectory", () => {
+			const config = loadDefaultsConfig(CWD);
+			const result = evaluateProtectedPaths("write", { path: "deploy/k8s/secrets.json" }, config);
+			assert.equal(result.action, "block");
+		});
+	});
+});
+
+// ── Symlink to a protected structured file (defaults patterns) ────────
+//
+// The M1 describe above uses custom patterns; this one uses the REAL
+// defaults to confirm the new `*credentials.json` pattern catches a
+// symlink whose real target is `oauth-credentials.json`.
+
+describe("defaults — symlink to a protected structured file (ADR-0011)", () => {
+	let boundary: string;
+	let outside: string;
+
+	beforeEach(() => {
+		boundary = mkdtempSync(resolve(tmpdir(), "pi-pp-def-boundary-"));
+		outside = mkdtempSync(resolve(tmpdir(), "pi-pp-def-outside-"));
+	});
+
+	afterEach(() => {
+		if (boundary && existsSync(boundary)) rmSync(boundary, { recursive: true, force: true });
+		if (outside && existsSync(outside)) rmSync(outside, { recursive: true, force: true });
+	});
+
+	it("blocks write to a symlink whose real target is oauth-credentials.json", () => {
+		const realTarget = resolve(outside, "oauth-credentials.json");
+		writeFileSync(realTarget, '{"client_id":"x"}', "utf-8");
+		const linkPath = resolve(boundary, "link");
+		symlinkSync(realTarget, linkPath);
+
+		const config = loadDefaultsConfig(boundary);
+
+		const result = evaluateProtectedPaths("write", { path: "./link" }, config);
+		assert.equal(
+			result.action,
+			"block",
+			"symlink to oauth-credentials.json must block via the defaults *credentials.json pattern",
+		);
 	});
 });

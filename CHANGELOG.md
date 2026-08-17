@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Reduced protected-paths false positives: replaced the broad lexical defaults `*secret*`, `*credential*`, and `*token*.json` with precise patterns targeting structured credential/secret/token files by extension (`*credentials.{json,yaml,yml,toml}`, `*credential.{json,yaml,yml,toml}`, `*secrets.{json,yaml,yml,toml}`, `*secret.{json,yaml,yml,toml}`, `*token.json`, `*tokens.json`). Source files named `credentials.go`, `secret.go`, `token.go`, and `credentials.ts` are no longer blocked; structured files like `oauth-credentials.json` and `secrets.json` remain protected. The secret scanner (ADR-0002) still covers secret content regardless of filename. See ADR-0011.
+
 ## [1.1.0] - 2026-07-30
 
 ### Added
