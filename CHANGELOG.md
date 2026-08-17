@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-17
+
 ### Fixed
 - Injection scanner no longer scans the trusted system prompt. The system prompt is agent infrastructure, not user input, and wrapping legitimate examples of injection phrasing inside it (e.g. an `AGENTS.md` rule that quotes "Ignore previous instructions" to describe what to watch for) in `[UNTRUSTED CONTENT]` markers corrupted the context of smaller / local models and could crash the session (issue #14). The scanner now skips the well-known system-prompt carrier locations across every provider pi ships: the top-level `system` (Anthropic) and `systemInstruction` (Google) fields, and messages carrying `role: "system"` or `role: "developer"` (OpenAI Chat / Codex / Anthropic developer role). User messages, tool results, and fetched content are still scanned. The walk remains provider-agnostic — it skips a bounded allowlist of trusted carriers rather than parsing provider message structure (ADR-0002/0006 preserved).
 - Raised the metrics anomaly thresholds to avoid false positives on modern large-context models: `tokensPerTurnWarn` 8000 → 32000 and `tokensSessionWarn` 50000 → 200000 (`toolCallsPerMinuteWarn` unchanged at 60). The metrics scanner never blocks, so the previous low thresholds produced noisy warnings on legitimate heavy workflows. Existing users keep their machine-layer `security-policy.json` customisations; see the README troubleshooting for adopting the raised defaults.
 - Documented the injection scanner, metrics scanner, `injection-rules.json`, and `security-policy.json` in the README. The Scanners table, Config files table, and a new Anomaly thresholds section now describe how to tune the machine-only pattern set and thresholds (a project-layer file is ignored — ADR-0006/0009).
 - Reduced protected-paths false positives: replaced the broad lexical defaults `*secret*`, `*credential*`, and `*token*.json` with precise patterns targeting structured credential/secret/token files by extension (`*credentials.{json,yaml,yml,toml}`, `*credential.{json,yaml,yml,toml}`, `*secrets.{json,yaml,yml,toml}`, `*secret.{json,yaml,yml,toml}`, `*token.json`, `*tokens.json`). Source files named `credentials.go`, `secret.go`, `token.go`, and `credentials.ts` are no longer blocked; structured files like `oauth-credentials.json` and `secrets.json` remain protected. The secret scanner (ADR-0002) still covers secret content regardless of filename. See ADR-0011.
+
+### Changed
+- Bumped `undici` override to `^8.10.0` ( Dependabot #13)
+- Bumped `brace-expansion` to `5.0.9` (Dependabot #12)
+- Bumped `tsx` dev dependency (Dependabot #11)
 
 ## [1.1.0] - 2026-07-30
 
