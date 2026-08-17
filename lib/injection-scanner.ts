@@ -1,10 +1,17 @@
 /**
  * Injection scanner — `before_provider_request` handler.
  *
- * Heuristic prompt-injection detection. Provider-agnostic: recursively walks
- * the entire payload for string values, runs regex heuristics, and wraps
- * suspicious segments in `[UNTRUSTED CONTENT]…[/UNTRUSTED CONTENT]` markers.
- * No parsing of provider-specific message structures (ADR-0002).
+ * Heuristic prompt-injection detection. Provider-agnostic: recursively
+ * walks the provider payload for string values, runs regex heuristics,
+ * and wraps suspicious segments in `[UNTRUSTED CONTENT]…[/UNTRUSTED CONTENT]`
+ * markers. No parsing of provider-specific message structures (ADR-0002).
+ *
+ * The trusted system prompt is excluded from the walk (see
+ * `walkAndMark`): the system prompt is agent infrastructure, not user
+ * input, and wrapping legitimate examples of injection phrasing inside
+ * it corrupts the context of smaller / local models. Every other string
+ * in the payload — user messages, tool results, fetched content — is
+ * scanned.
  *
  * This is a SCANNER: it detects, marks, and notifies but NEVER blocks the
  * provider request (ADR-0006; CONTEXT.md — "a Scanner ... never prevent(s)
@@ -162,6 +169,20 @@ function scanString(text: string, findings: InjectionFinding[]): string {
  * it together with the aggregated findings. Depth is capped at 50.
  * Does NOT parse provider message structure (ADR-0002) — this is the
  * symmetric counterpart of the secret scanner's `walkAndRedact`.
+ *
+ * Trust boundary: the system prompt is trusted agent infrastructure,
+ * not user input or tool output. It is excluded from injection scanning
+ * so that legitimate examples of injection phrasing inside it (e.g. an
+ * AGENTS.md rule that quotes "Ignore previous instructions" to describe
+ * what to watch for) are not wrapped in `[UNTRUSTED CONTENT]` markers —
+ * wrapping them corrupts the context of smaller / local models and can
+ * crash the session. The exclusion is a bounded, provider-agnostic
+ * allowlist of the well-known carrier locations across every provider pi
+ * ships: the top-level `system` (Anthropic) and `systemInstruction`
+ * (Google) fields, and messages carrying `role: "system"` or
+ * `role: "developer"` (OpenAI Chat / Codex / Anthropic developer role).
+ * It does not parse arbitrary message structure — it skips the known
+ * trusted carriers and continues the string walk everywhere else.
  */
 export function walkAndMark(payload: unknown): {
 	findings: InjectionFinding[];
@@ -170,6 +191,32 @@ export function walkAndMark(payload: unknown): {
 	const findings: InjectionFinding[] = [];
 	const result = walkNode(payload, findings, 0);
 	return { findings, payload: result };
+}
+
+/**
+ * Top-level payload keys that carry the trusted system prompt across
+ * providers. Skipping these keys (and their subtrees) prevents the
+ * scanner from marking trusted infrastructure as untrusted.
+ */
+const TRUSTED_SYSTEM_KEYS: ReadonlySet<string> = new Set(["system", "systemInstruction"]);
+
+/**
+ * Message roles that identify trusted system-prompt messages inside a
+ * `messages` array (OpenAI Chat / Codex / Anthropic developer role).
+ * A message is an object with a `role` string field; entries whose role
+ * is in this set are skipped wholesale.
+ */
+const TRUSTED_SYSTEM_ROLES: ReadonlySet<string> = new Set(["system", "developer"]);
+
+/**
+ * Identify a payload entry as a trusted system-prompt message: an object
+ * carrying a `role` string that matches one of `TRUSTED_SYSTEM_ROLES`.
+ * Used to skip message-array elements without parsing their content.
+ */
+function isTrustedSystemMessage(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	const role = (value as Record<string, unknown>).role;
+	return typeof role === "string" && TRUSTED_SYSTEM_ROLES.has(role);
 }
 
 function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): unknown {
@@ -181,6 +228,8 @@ function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): un
 
 	if (Array.isArray(obj)) {
 		for (let i = 0; i < obj.length; i++) {
+			// Skip trusted system-prompt messages (role: system|developer).
+			if (isTrustedSystemMessage(obj[i])) continue;
 			obj[i] = walkNode(obj[i], findings, depth + 1);
 		}
 		return obj;
@@ -189,6 +238,9 @@ function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): un
 	if (obj !== null && typeof obj === "object") {
 		const record = obj as Record<string, unknown>;
 		for (const key of Object.keys(record)) {
+			// Skip trusted system-prompt carrier fields (system,
+			// systemInstruction) and their subtrees entirely.
+			if (TRUSTED_SYSTEM_KEYS.has(key)) continue;
 			record[key] = walkNode(record[key], findings, depth + 1);
 		}
 		return obj;

@@ -90,9 +90,9 @@ export type SecurityPolicy = SecurityLimits;
 export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
 	toolCallsPerTurn: 100,
 	confirmationsPerSession: 200,
-	tokensPerTurnWarn: 8000,
+	tokensPerTurnWarn: 32000,
 	toolCallsPerMinuteWarn: 60,
-	tokensSessionWarn: 50000,
+	tokensSessionWarn: 200000,
 };
 
 export interface Config {

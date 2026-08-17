@@ -1,7 +1,7 @@
 {
   "toolCallsPerTurn": 100,
   "confirmationsPerSession": 200,
-  "tokensPerTurnWarn": 8000,
+  "tokensPerTurnWarn": 32000,
   "toolCallsPerMinuteWarn": 60,
-  "tokensSessionWarn": 50000
+  "tokensSessionWarn": 200000
 }

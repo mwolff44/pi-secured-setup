@@ -29,16 +29,21 @@ import { auditLog } from "./audit.js";
 
 /**
  * Shipped default anomaly thresholds. Generous defaults that avoid false
- * positives on legitimate heavy workflows while still alerting on runaway
- * loops and denial-of-wallet patterns. Mirrored into
- * `defaults/security-policy.json` and `DEFAULT_SECURITY_POLICY` so all
- * three locations stay in sync; this constant is the final fallback when
- * neither the config layer nor `DEFAULT_SECURITY_POLICY` supplies a value.
+ * positives on legitimate heavy workflows — including modern
+ * large-context models (150k+ tokens) and tool-bearing turns whose
+ * definitions alone routinely consume 10–20k tokens — while still
+ * alerting on runaway loops and denial-of-wallet patterns. Mirrored
+ * into `defaults/security-policy.json` and `DEFAULT_SECURITY_POLICY` so
+ * all three locations stay in sync; this constant is the final fallback
+ * when neither the config layer nor `DEFAULT_SECURITY_POLICY` supplies a
+ * value. Operators can tune all three thresholds via the machine-layer
+ * `~/.pi/agent/security/security-policy.json` (the project layer cannot
+ * raise them — see ADR-0009).
  */
 export const DEFAULT_METRICS_THRESHOLDS = {
-	tokensPerTurnWarn: 8000,
+	tokensPerTurnWarn: 32000,
 	toolCallsPerMinuteWarn: 60,
-	tokensSessionWarn: 50000,
+	tokensSessionWarn: 200000,
 } as const;
 
 /** Sliding-window duration for the tool-calls-per-minute estimate. */
