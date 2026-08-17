@@ -3,12 +3,13 @@
  */
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { mergePatterns, mergeProtectedPaths, mergeCommandRules, loadConfig } from "../lib/config.js";
 import type { ProtectedPathsConfig, CommandRulesConfig } from "../lib/config.js";
 import { classifySegment } from "../lib/bash-gate.js";
+import { DEFAULTS_DIR } from "../lib/utils.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 const pp = (
@@ -258,6 +259,103 @@ describe("mergeProtectedPaths", () => {
 			pp(["!.ENV"]),
 		]);
 		assert.ok(result.patterns.includes(".env"), "case-insensitive exclusion of baseline is ignored");
+	});
+});
+
+// ── Corrected defaults + baseline lock (ADR-0011) ─────────────────────
+//
+// Loads the REAL shipped defaults/protected-paths.json so a regression
+// (re-adding `*secret*`/`*credential*`) is caught here, and exercises the
+// three-layer merge against the corrected baseline.
+
+function loadDefaultsPP(): ProtectedPathsConfig {
+	const raw = readFileSync(resolve(DEFAULTS_DIR, "protected-paths.json"), "utf-8");
+	return JSON.parse(raw) as ProtectedPathsConfig;
+}
+
+describe("mergeProtectedPaths — corrected defaults (ADR-0011)", () => {
+	let consoleErrorMock: ReturnType<typeof mock.method>;
+
+	beforeEach(() => {
+		consoleErrorMock = mock.method(console, "error", () => {});
+	});
+
+	afterEach(() => {
+		consoleErrorMock.mock.restore();
+	});
+
+	it("shipped defaults no longer contain broad lexical patterns", () => {
+		const def = loadDefaultsPP();
+		assert.ok(!def.patterns.includes("*secret*"), "broad *secret* must be removed from defaults");
+		assert.ok(!def.patterns.includes("*credential*"), "broad *credential* must be removed");
+		assert.ok(!def.patterns.includes("*token*.json"), "broad *token*.json must be removed");
+	});
+
+	it("shipped defaults contain the structured-format replacement patterns", () => {
+		const def = loadDefaultsPP();
+		for (const p of [
+			"*credentials.json",
+			"*credentials.yaml",
+			"*credentials.yml",
+			"*credentials.toml",
+			"*credential.json",
+			"*secrets.json",
+			"*secrets.yaml",
+			"*secret.json",
+			"*token.json",
+			"*tokens.json",
+		]) {
+			assert.ok(def.patterns.includes(p), `defaults must include ${p}`);
+		}
+	});
+
+	it("machine layer can add protected patterns on top of the corrected defaults", () => {
+		const def = loadDefaultsPP();
+		const result = mergeProtectedPaths([def, pp(["machine-secret.txt"]), undefined]);
+		assert.ok(result.patterns.includes("machine-secret.txt"), "machine addition present");
+		assert.ok(result.patterns.includes("*credentials.json"), "baseline pattern preserved");
+	});
+
+	it("project layer can add protected patterns (strengthen)", () => {
+		const def = loadDefaultsPP();
+		const result = mergeProtectedPaths([def, undefined, pp(["custom-secret.txt"])]);
+		assert.ok(result.patterns.includes("custom-secret.txt"), "project addition present");
+		assert.ok(result.patterns.includes("*credentials.json"), "baseline preserved");
+	});
+
+	it("project layer cannot remove a corrected-default baseline pattern via !", () => {
+		const def = loadDefaultsPP();
+		const result = mergeProtectedPaths([def, undefined, pp(["!*credentials.json"])]);
+		assert.ok(
+			result.patterns.includes("*credentials.json"),
+			"baseline *credentials.json must survive a project-layer exclusion",
+		);
+		assert.ok(
+			consoleErrorMock.mock.calls.some((c) =>
+				/Project-layer protected-path exclusion.*\*credentials\.json/.test(String(c.arguments[0])),
+			),
+			"must warn that the baseline-weakening project exclusion was ignored",
+		);
+	});
+
+	it("project exclusion of a pattern absent from the baseline is a silent no-op", () => {
+		const def = loadDefaultsPP();
+		const result = mergeProtectedPaths([def, undefined, pp(["!*secret*", "added"])]);
+		assert.ok(!result.patterns.includes("*secret*"), "*secret* is not in defaults; nothing to exclude");
+		assert.ok(result.patterns.includes("added"), "non-exclusion additions are kept");
+		assert.equal(consoleErrorMock.mock.calls.length, 0, "excluding a non-baseline pattern must not warn");
+	});
+
+	it("corrected defaults + machine + project merge keeps the full baseline and project additions", () => {
+		const def = loadDefaultsPP();
+		const result = mergeProtectedPaths([
+			def,
+			pp(["machine-extra.yaml"]),
+			pp(["project-extra.json"]),
+		]);
+		assert.ok(result.patterns.includes("*credentials.json"), "default baseline present");
+		assert.ok(result.patterns.includes("machine-extra.yaml"), "machine addition present");
+		assert.ok(result.patterns.includes("project-extra.json"), "project addition present");
 	});
 });
 

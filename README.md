@@ -22,7 +22,7 @@ pi update pi-secured-setup
 | Guard | Applies To | Behavior |
 |-------|-----------|----------|
 | **Boundary** | `read`, `write`, `edit` | Blocks writes outside the project directory (`cwd`). Confirms reads outside boundary. External paths can be whitelisted. |
-| **Protected paths** | `read`, `write`, `edit` | Blocks writes to sensitive files (`.env`, `*.key`, `*.pem`, etc.). Confirms reads. Patterns are configurable. |
+| **Protected paths** | `read`, `write`, `edit` | Blocks writes to sensitive files (`.env`, `*.key`, `*.pem`, structured credential files like `*credentials.json`, `*secrets.yaml`, etc.). Confirms reads. Patterns are configurable. |
 | **Bash gate** | `bash` | Classifies commands as SAFE / MODERATE / DANGEROUS / EXTERNAL. Dangerous and external commands require confirmation. Unknown commands also require confirmation. |
 
 All three guards run in a **single combined handler** (ADR-0001) with fixed order: boundary → protected-paths → bash-gate. First block wins.
@@ -64,14 +64,31 @@ Pattern lists are **additive** — each layer can add new patterns. A `!` prefix
 // .pi/security/protected-paths.json — project override
 {
   "patterns": [
-    "!*secret*",        // Remove the inherited *secret* pattern
-    "config/local.json" // Add a project-specific pattern
+    "!*credentials.json", // Remove the inherited *credentials.json pattern (ignored — baseline; see ADR-0009)
+    "config/local.json"   // Add a project-specific pattern
   ],
   "readAction": "allow" // Override: don't confirm reads for protected files
 }
 ```
 
-Non-pattern fields (like `writeAction`, `readAction`) in later layers replace earlier values.
+> **Note:** the project layer cannot remove baseline patterns via `!` — such exclusions are ignored with a warning (ADR-0009). A project can only **add** patterns (strengthen). To relax a default, use the machine layer (`~/.pi/agent/security/`).
+
+Non-pattern fields (like `writeAction`, `readAction`) in later layers replace earlier values, clamped to the baseline restrictiveness at the project layer.
+
+### What gets protected — naming vs. content
+
+The shipped defaults protect files by **format and role**, not by the presence of a keyword in the filename. Source files named `credentials.go`, `secret.go`, `token.go`, or `credentials.ts` are **not** protected by default — they are code, not secrets. The defaults target structured credential/secret/token files with sensitive extensions:
+
+- `.env`, `.env.*` — environment files
+- `*.key`, `*.pem`, `*.p12`, `*.pfx` — private keys and certificates
+- `id_rsa*`, `id_ed25519*`, `id_ecdsa*` — SSH keys
+- `*credentials.{json,yaml,yml,toml}`, `*credential.{json,yaml,yml,toml}` — credential files
+- `*secrets.{json,yaml,yml,toml}`, `*secret.{json,yaml,yml,toml}` — secret files
+- `*token.json`, `*tokens.json` — token files
+
+A source file named `secret.go` stays editable; a structured file named `oauth-credentials.json` is blocked. This avoids blocking legitimate source files while guarding files that, by convention, carry real secrets.
+
+The **secret scanner** (ADR-0002) provides a second, independent layer: regardless of a file's name, any secret value that reaches the provider payload is redacted before it enters the LLM context. Together, the protected-paths guard covers *files sensitive by naming convention*, and the secret scanner covers *content sensitive by shape*.
 
 ### Config files
 
@@ -158,3 +175,37 @@ defaults/
 There is no bypass flag. If a guard is too restrictive:
 1. Edit the config file (`~/.pi/agent/security/` or `.pi/security/`)
 2. Run `/reload` to apply changes
+
+## Troubleshooting
+
+### I updated to the latest version, but `credentials.go` / `secret.go` is still blocked
+
+The corrected defaults (ADR-0011) target structured credential files by extension (`*credentials.json`, `*secrets.yaml`, etc.) rather than matching the keyword in any filename. If a source file named `credentials.go` is still blocked after updating, your **machine-layer** config still contains the old broad patterns.
+
+The machine config (`~/.pi/agent/security/protected-paths.json`) is copied from the shipped defaults **only on first run** — it is never overwritten by `pi update` (so your customisations are preserved). This means a machine config copied from an older version of the package still carries the broad `*secret*` / `*credential*` / `*token*.json` patterns, and those are merged additively on top of the corrected defaults.
+
+To adopt the corrected defaults at the machine layer, pick one:
+
+```bash
+# Option A — re-trigger the copy from the shipped defaults (loses machine-layer customisations)
+rm ~/.pi/agent/security/protected-paths.json
+# The next pi session recreates it from the updated defaults/
+
+# Option B — keep your customisations, just remove the three broad patterns
+# Edit ~/.pi/agent/security/protected-paths.json and delete the lines:
+#   "*secret*", "*credential*", "*token*.json"
+```
+
+You can verify which patterns are active with `/security` (dashboard shows the merged protected-path list).
+
+### A file I consider sensitive is not protected by default
+
+The defaults protect files by **format and role**, not by keyword in the filename. A file like `token-handler.json` or `secret-manager.yaml` is not protected because its name describes a *role*, not a secret. If your project genuinely needs to protect such a file, add a specific pattern in `.pi/security/protected-paths.json`:
+
+```jsonc
+{
+  "patterns": ["token-handler.json", "secret-manager.yaml"]
+}
+```
+
+Remember: the **secret scanner** (ADR-0002) still redacts any secret value that reaches the provider payload, regardless of the source file's name. The protected-paths guard covers *files sensitive by naming convention*; the secret scanner covers *content sensitive by shape*.
