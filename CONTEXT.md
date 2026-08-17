@@ -41,7 +41,7 @@ A credential value (API key, password, token, private key, connection string) th
 _Avoid_: Credential, sensitive data, key (ambiguous with cryptographic key)
 
 **Injection scanner**:
-A Scanner that detects heuristic prompt-injection patterns (role-override, fake structural tags, instruction smuggling) by walking the provider payload strings — provider-agnostic, like the secret scanner. Detected segments are wrapped in `[UNTRUSTED CONTENT]…[/UNTRUSTED CONTENT]` markers; the user is notified and an `injection.detected` audit event is emitted. It NEVER blocks (Scanner semantics). Patterns are loaded machine-only from `injection-rules.json`.
+A Scanner that detects heuristic prompt-injection patterns (role-override, fake structural tags, instruction smuggling) by walking the provider payload strings — provider-agnostic, like the secret scanner. The trusted system prompt is excluded from the walk (it is agent infrastructure, not user input); see ADR-0012. Detected segments in user/tool/fetched content are wrapped in `[UNTRUSTED CONTENT]…[/UNTRUSTED CONTENT]` markers; the user is notified and an `injection.detected` audit event is emitted. It NEVER blocks (Scanner semantics). Patterns are loaded machine-only from `injection-rules.json`.
 _Avoid_: Prompt filter, injection blocker, jailbreak detector
 
 **Metrics scanner**:
@@ -69,6 +69,7 @@ _Avoid_: Throttling, quota
 - A **Guard** operates on tool calls *before* execution via a single combined `tool_call` handler. A **Scanner** operates on tool results or provider payloads *after* execution.
 - **Guard pipeline** evaluates checks in fixed order: input-shape validation → rate-limit check → boundary → protected-paths → bash-gate (with bash exfiltration detection before classification). First block wins. No short-circuit past a confirmation.
 - An **Injection scanner** and a **Metrics scanner** join the **Secret scanner** as `before_provider_request`/`after_provider_response` observers.
+- The **Secret scanner** walks the entire provider payload including the trusted system prompt — secrets must be redacted wherever they appear. The **Injection scanner** skips the trusted system prompt (a bounded allowlist of carrier keys `system`/`systemInstruction` and message roles `system`/`developer`) but scans every other string — user messages, tool results, fetched content. The trust boundary for injection marking does not apply to secret redaction (ADR-0012).
 - Symlinks are resolved (`realpath`) before boundary checks; broken symlinks fail closed (write/edit block, read confirm).
 - Non-interactive modes (`ctx.mode !== "tui"`) fail closed for any action requiring confirmation.
 - Secret scanning is provider-agnostic: the Scanner recursively walks the provider payload for all string values and runs regex matching, ignoring message structure differences between Anthropic, OpenAI, Google, etc.

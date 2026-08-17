@@ -32,6 +32,8 @@ All three guards run in a **single combined handler** (ADR-0001) with fixed orde
 | Scanner | Mechanism | Behavior |
 |---------|-----------|----------|
 | **Secret scanner** | `before_provider_request` | Recursively walks the provider payload for strings matching 15+ secret patterns (AWS keys, LLM keys, private keys, DB connection strings, GitHub tokens, etc.). Redacts as `***REDACTED:{pattern-name}***`. Provider-agnostic. |
+| **Injection scanner** | `before_provider_request` | Heuristically detects prompt-injection patterns (role-override, fake structural tags, instruction smuggling) in the provider payload and wraps suspicious segments in `[UNTRUSTED CONTENT]…[/UNTRUSTED CONTENT]` markers. The trusted system prompt is excluded from scanning. Emits an `injection.detected` audit event and notifies. Never blocks. Patterns are machine-only configurable (`injection-rules.json`). |
+| **Metrics scanner** | `before_provider_request` + `after_provider_response` | Estimates tokens per turn (provider `usage` when present, else chars/4), emits `turn.metrics` audit events, and warns on anomaly thresholds (tokens per turn, tokens per session, tool calls per minute). Never blocks. Thresholds are machine-only configurable (`security-policy.json`). |
 | **Skill scanner** | `session_start` | Hashes `SKILL.md` for every discovered skill. Prompts for approval of new or changed skills. Previously skipped/unapproved skills show a notification only. |
 
 ### Audit log
@@ -92,13 +94,15 @@ The **secret scanner** (ADR-0002) provides a second, independent layer: regardle
 
 ### Config files
 
-| File | Purpose |
-|------|---------|
-| `protected-paths.json` | Glob patterns for sensitive files + read/write actions |
-| `command-rules.json` | Regex patterns for SAFE / MODERATE / DANGEROUS / EXTERNAL command classification |
-| `allowed-external.json` | Paths outside the project boundary that are allowed |
-| `audit-config.json` | Log rotation settings (`maxFileSize`, `maxFiles`) |
-| `skill-approvals.json` | Auto-managed — skill hashes + approval decisions |
+| File | Layer | Purpose |
+|------|-------|---------|
+| `protected-paths.json` | all | Glob patterns for sensitive files + read/write actions |
+| `command-rules.json` | all | Regex patterns for SAFE / MODERATE / DANGEROUS / EXTERNAL command classification |
+| `allowed-external.json` | all | Paths outside the project boundary that are allowed |
+| `audit-config.json` | machine | Log rotation settings (`maxFileSize`, `maxFiles`) |
+| `injection-rules.json` | machine | Prompt-injection heuristic patterns + per-turn `threshold` (a project-layer file is ignored — see ADR-0006) |
+| `security-policy.json` | machine | Rate limits (`toolCallsPerTurn`, `confirmationsPerSession`) + metrics anomaly thresholds (`tokensPerTurnWarn`, `toolCallsPerMinuteWarn`, `tokensSessionWarn`). A project-layer file is ignored — see ADR-0009. |
+| `skill-approvals.json` | machine | Auto-managed — skill hashes + approval decisions |
 
 ### Per-project example
 
@@ -139,6 +143,36 @@ Then add any of these files:
 }
 ```
 
+### Anomaly thresholds (metrics scanner)
+
+The metrics scanner warns when token or tool-call counters cross a threshold — it never blocks. The shipped defaults are generous (tuned for modern large-context models), but operators with very large contexts or tight budgets can tune them in the **machine-layer** `~/.pi/agent/security/security-policy.json`:
+
+```jsonc
+{
+  "tokensPerTurnWarn": 32000,      // warn when a single turn exceeds N tokens
+  "toolCallsPerMinuteWarn": 60,    // warn above N provider round-trips per minute
+  "tokensSessionWarn": 200000      // warn when the cumulative session total exceeds N tokens
+}
+```
+
+Set a field to `0` to disable that specific warning. The project layer cannot raise or disable these thresholds (ADR-0009) — a checked-in `.pi/security/security-policy.json` is ignored with a warning. Reload with `/reload` after editing.
+
+### Injection scanner patterns
+
+The injection scanner ships a curated, machine-only pattern set in `~/.pi/agent/security/injection-rules.json`. Each entry is a case-insensitive regex with a name; the `threshold` field controls when the per-turn notification escalates from `warning` to `error`:
+
+```jsonc
+{
+  "patterns": [
+    { "name": "ignore-previous-instructions", "pattern": "ignore (?:all |the |everything |any |your )?(?:previous|prior|above|earlier) (?:instructions|rules|prompts?)" }
+    // …more shipped patterns
+  ],
+  "threshold": 3
+}
+```
+
+The trusted system prompt is excluded from scanning, so legitimate examples of injection phrasing inside it (e.g. an `AGENTS.md` rule that quotes "Ignore previous instructions" to describe what to watch for) are not wrapped in `[UNTRUSTED CONTENT]` markers. A project-layer `injection-rules.json` is ignored — see ADR-0006.
+
 ## Architecture
 
 See [CONTEXT.md](CONTEXT.md) for domain terminology and [docs/adr/](docs/adr/) for architectural decision records.
@@ -152,15 +186,20 @@ lib/
   boundary.ts           # Boundary evaluation (ADR-0003)
   protected-paths.ts    # Protected path glob matching
   bash-gate.ts          # Command classification (SAFE/MODERATE/DANGEROUS/EXTERNAL)
+  rate-limiter.ts       # Per-turn / per-session caps (ADR-0009)
   secret-scanner.ts     # Provider-agnostic secret redaction (ADR-0002)
+  injection-scanner.ts  # Heuristic prompt-injection marking (ADR-0006)
+  metrics-scanner.ts    # Token / anomaly metrics + warnings
   skill-scanner.ts      # SKILL.md hash verification (ADR-0004)
-  audit.ts              # JSONL audit log + rotation + /security commands
+  audit.ts              # JSONL audit log + HMAC chain + /security commands
   utils.ts              # Shared helpers
 defaults/
   protected-paths.json  # Default global protected patterns
   command-rules.json    # Default command classification rules
   allowed-external.json # Default allowed external paths
   audit-config.json     # Default rotation settings
+  injection-rules.json  # Default injection heuristic patterns (machine-only)
+  security-policy.json  # Default rate limits + anomaly thresholds (machine-only)
 ```
 
 ## First-run experience
@@ -209,3 +248,27 @@ The defaults protect files by **format and role**, not by keyword in the filenam
 ```
 
 Remember: the **secret scanner** (ADR-0002) still redacts any secret value that reaches the provider payload, regardless of the source file's name. The protected-paths guard covers *files sensitive by naming convention*; the secret scanner covers *content sensitive by shape*.
+
+### I updated to the latest version, but I still get token-spike / session-budget warnings
+
+The metrics anomaly thresholds were raised (tokens per turn 8000 → 32000, session budget 50000 → 200000) to avoid false positives on modern large-context models. The machine config (`~/.pi/agent/security/security-policy.json`) is copied from the shipped defaults **only on first run** — it is never overwritten by `pi update` (so your customisations are preserved). This means a machine config copied from an older version still carries the old low thresholds.
+
+To adopt the raised defaults, pick one:
+
+```bash
+# Option A — re-trigger the copy from the shipped defaults (loses machine-layer customisations)
+rm ~/.pi/agent/security/security-policy.json
+# The next pi session recreates it from the updated defaults/
+
+# Option B — keep your customisations, just raise the three thresholds
+# Edit ~/.pi/agent/security/security-policy.json and set:
+#   "tokensPerTurnWarn": 32000,
+#   "toolCallsPerMinuteWarn": 60,
+#   "tokensSessionWarn": 200000
+```
+
+You can also tune the thresholds to your model's context size (e.g. set `tokensSessionWarn` to ~2/3 of your context window). Set a field to `0` to disable that specific warning.
+
+### The injection scanner flags legitimate content
+
+The injection scanner is heuristic by nature and may flag legitimate text that happens to match an injection pattern. The trusted system prompt is excluded from scanning, so examples inside it are safe. If a pattern produces false positives on user or tool-result content, you can remove or tighten it in the machine-layer `~/.pi/agent/security/injection-rules.json`, then run `/reload`.
