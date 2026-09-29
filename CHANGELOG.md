@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-09-29
+
+### Added
+- Regression tests pinning bash-gate newline-bypass coverage. Greywall's `command.deny` splits commands on `|`, `||`, `&&`, and `;` but not on newlines, so a dangerous command on a continuation line, in a heredoc, or in a `.sh` file traverses it unseen. The tests pin that the bash gate's dangerous-pattern regexes stay unanchored and match mid-string, so the sandbox gap stays closed by the gate and the property is not lost by accident.
+
+### Changed
+- Bumped `tsx` dev dependency (Dependabot #15, #18, #19)
+
 ## [1.1.1] - 2026-08-17
 
 ### Fixed
