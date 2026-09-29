@@ -98,7 +98,7 @@ Résumé par version ; détail et citations dans les CHANGELOGs liés en §2.
 | R5 | `ctx.mode` : union miroir locale `"tui"\|"rpc"\|"json"\|"print"` non importée — un nouveau mode amont tomberait silencieusement dans la branche fail-closed (`mode !== "tui"`) sans erreur de type | `extensions.md` @v0.87.1 (liste des modes non re-vérifiée ligne à ligne — voir §10) | `lib/guard-pipeline.ts:151, 158-206` | **Faible** (fail-closed = sûr mais plus restrictif) | test manuel en modes `print`/`json` | Mettre à jour l'union si nouveau mode documenté |
 | R6 | Contrat `registerCommand(name, { description, handler })` — 6 commandes `/security:*` | Aucun changement annoncé dans les CHANGELOGs 0.84→0.87.1 | `lib/audit.ts:1101-1258` ; mock étroit `test/audit.test.ts:1192,1207` | **Faible** | test manuel (commandes listées) | — |
 | R7 | Overrides vs nouvel arbre : `undici` (amont passe du pin 8.5.0 à 8.10.2 ; notre `^8.10.2` force 8.11.2 — converge) ; `protobufjs` (source unique `@google/genai` passe en 2.x → override possiblement **inert**) ; `ws` (genai 2.x + openai restent) | Manifests deps 0.83.0 vs 0.87.1 (registry) | `package.json:29-33` ; lock : `undici` via pi-coding-agent (:605), `protobufjs` via `@google/genai` (:1407), `ws` via genai/mistral/openai (:1408/1468/2901) ; `@mistralai/mistralai` **retiré** en 0.84.2 | **Faible** | `npm ls undici protobufjs ws` post-install | Garder les planchers sécurité ; retirer un override devenu inerte (facultatif) |
-| R8 | SBOM : `bom.json` à régénérer — diff substantiel (retraits `glob`, `@mistralai/mistralai`, `@opentelemetry/api` ; ajouts `@earendil-works/chord`, `@earendil-works/pi-telemetry` ; bumps majeurs) | Manifests + CHANGELOGs §0.84.2/0.84.3/0.86.0 | `package.json:17` (script `sbom`) | **Faible** (procédural) | `npm run sbom` + diff | Revoir et committer le nouveau `bom.json` |
+| R8 | SBOM : `bom.json` à régénérer — diff substantiel (retraits `glob`, `@mistralai/mistralai`, `@opentelemetry/api` ; ajouts `@earendil-works/chord`, `@earendil-works/pi-telemetry` ; bumps majeurs) | Manifests + CHANGELOGs §0.84.2/0.84.3/0.86.0 | `package.json:17` (script `sbom`) | **Faible** (procédural) | `npm run sbom` + revue du contenu | Revoir le nouveau `bom.json` — vérification locale uniquement (fichier gitignoré, `.gitignore:5`) |
 | R9 | Résolution `defaults/` : via `import.meta.url` (package-relative), donc **hors** du changement 0.84.3 d'expansion des ressources pi-package ; reste à confirmer au chargement jiti | CHANGELOG pi-coding-agent §0.84.3 (glob natif Node) | `lib/utils.ts:116-119` ; `lib/config.ts:135` | **Faible** | test manuel (config chargée) | — |
 | R10 | Compat TypeScript 7.0.2 avec les `.d.ts` des nouveaux packages | Manifests : aucun prérequis TS déclaré aux deux bornes ; `skipLibCheck` couvre les erreurs internes (pas les erreurs de syntaxe) | `tsconfig.json` (`skipLibCheck: true`) ; `package.json:27` | **Faible** | `tsc --noEmit` | — |
 | R11 | Gate coverage c8 (lignes 86 %, `lib/**`) | — (imports type-only effacés au runtime ; aucun changement de code prévu) | `package.json:16` ; §3.1 | **Aucun attendu** | `npm run test:coverage` | — |
@@ -169,7 +169,7 @@ Pour une extension dont la fonction est d'empêcher des actions dangereuses, ces
 2. **`package.json`** — seul fichier à modifier a priori : peers `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` de `^0.83.0` → `^0.87.1` (3 lignes, lignes 20-22). Rien d'autre : pas de devDeps à toucher, overrides conservés en l'état.
 3. **`package-lock.json`** — `npm install` ; vérifier l'absence d'`EBADENGINE` et la résolution unique des quatre packages (§9.1).
 4. **Code (conditionnel)** — si `tsc --noEmit` échoue : ajuster les `Pick<ExtensionUIContext, …>` (`lib/guard-pipeline.ts:139`, `lib/skill-scanner.ts:33`) ou les types des handlers concernés ; si le test manuel révèle un nouveau mode, mettre à jour l'union `PiMode` (`lib/guard-pipeline.ts:151`). Chaque retouche reste locale aux interfaces de narrowing — pas de propagation attendue.
-5. **`bom.json`** — `npm run sbom`, revue du diff (nouveaux composants attendus : `chord`, `pi-telemetry`, genai 2.x, chalk 6), commit.
+5. **`bom.json`** — `npm run sbom`, revue du contenu (nouveaux composants attendus : `chord`, `pi-telemetry`, genai 2.x, chalk 6). Vérification locale uniquement : `bom.json` est gitignoré (`.gitignore:5`), le SBOM est un artefact CI.
 6. **Clôture** — changelog maison / note de version ; suivre la convention du précédent upgrade documenté dans `docs/future-improvements.md`.
 
 ## 9. Plan de vérification
@@ -202,7 +202,7 @@ npm run test:coverage        # gate lignes 86 % (R11 : attendu inchangé)
 ### 9.4 SBOM
 
 ```bash
-npm run sbom && git diff --stat bom.json   # revue des composants (R8)
+npm run sbom   # revue du contenu — bom.json est gitignoré (R8)
 ```
 
 ### 9.5 Test manuel de chargement de l'extension (obligatoire — R4/R5/R6/R9)
@@ -223,3 +223,12 @@ Dans un sandbox avec un host Pi 0.87.1 :
 - La liste exacte des valeurs de `ctx.mode` à 0.87.1 n'a pas été re-relevée mot à mot dans `extensions.md` (R5 traité en vérification manuelle).
 - `typebox` 1.3.7 → 1.3.27 et `chalk` 5 → 6 (internes à Pi, non importés par nous) n'ont pas été audités indépendamment.
 - L'absence de régressions **non annoncées** ne peut être garantie par lecture — c'est précisément le rôle du test de chargement manuel, nos tests automatisés étant aveugles à la surface runtime de Pi (§3.1).
+
+## 11. Retour d'exécution (2026-09-29)
+
+Migration exécutée le 2026-09-29. Résultats : les quatre packages résolus à 0.87.1, dédupliqués ; `tsc --noEmit` et les 520 tests passent **sans aucun changement de code** ; coverage lignes 90,43 % (gate 86 %) ; `npm audit` 0 vulnérabilité (critical et high) ; SBOM régénéré localement (163 composants). Ajustements par rapport aux attentes ci-dessus :
+
+- `glob` reste présent dans le SBOM, mais côté dev uniquement (`c8 → test-exclude → glob@13`) — le retrait amont 0.84.3 concernait le glob *runtime* de Pi.
+- `ws` a résolu **8.22.0** (plage `^8.21.0` flottante à la re-résolution, plancher de sécurité respecté).
+- L'override `protobufjs` reste **actif** : `@google/genai@2.21.0` dépend toujours de `protobufjs` (résolu 7.6.6) — le scénario « override inerte » ne s'est pas produit.
+- Reste à exécuter : le test manuel de chargement §9.5 (seule vérification non automatisable — nos tests mockent `ExtensionAPI`).
