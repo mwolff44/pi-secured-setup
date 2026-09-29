@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-09-29
+
+### Security
+- Bumped the `undici` override from `^8.10.0` to `^8.10.2` (resolves 8.11.2), closing Dependabot alert #22: CVE-2026-85024 / GHSA-3wwx-pv8p-q78v — a remote WebSocket peer sending a permessage-deflate message that crosses the decompressed-payload size limit and then contains a malformed DEFLATE block crashes the whole Node.js process via an unhandled `error` on the internal `InflateRaw` (DoS only, no confidentiality or integrity impact; CVSS 5.9 Moderate, EPSS 0.4%). `undici` is transitive-only here — reachable via `@earendil-works/pi-coding-agent`, not bundled in its dist, and unused directly in `lib/` — and the install also reconciles the stale nested `8.5.0` copy that `npm ls` flagged `invalid`. The override protects this repository's tree; consumers of the pi-package resolve `undici` from their own root project, so full closure still requires an upstream bump from the `@earendil-works` publisher.
+
 ## [1.1.2] - 2026-09-29
 
 ### Added
