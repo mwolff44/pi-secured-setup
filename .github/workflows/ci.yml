@@ -5,7 +5,8 @@
 # downstream jobs only run when upstream succeeds (default behaviour).
 #
 # Notes:
-#   - Node 20 LTS is pinned via setup-node.
+#   - Node 22 LTS is pinned via setup-node (matches the pi packages'
+#     engines requirement: node >=22.19.0).
 #   - `npm ci` requires a committed package-lock.json (added in QW-2).
 #   - The type-check job is a hard gate: `npx tsc --noEmit` must pass
 #     with 0 errors. The pre-existing GuardVerdict.reason narrowing
@@ -45,10 +46,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
@@ -62,10 +63,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
@@ -93,10 +94,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
@@ -117,10 +118,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
@@ -143,10 +144,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
@@ -173,10 +174,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies (npm ci)
