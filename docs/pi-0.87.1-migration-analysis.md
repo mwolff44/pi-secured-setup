@@ -1,6 +1,6 @@
 # Analyse d'impact — migration Pi 0.83.0 → 0.87.1
 
-> **Statut** : analyse uniquement. Aucune modification de code ou de dépendance n'a été effectuée.
+> **Statut** : analyse **exécutée**. Ce document est l'analyse d'impact initiale, rédigée **avant** migration ; la migration a depuis été réalisée le 2026-09-29 — voir §11 « Retour d'exécution ». Les modifications ont porté sur les peers `package.json` (`^0.83.0` → `^0.87.1`), `package-lock.json` et la CI (Node 20 → 22).
 > **Date** : 2026-09-29. **Cible** : `@earendil-works/pi-coding-agent`, `pi-ai`, `pi-tui` `^0.83.0` → `^0.87.1` (transitif : `pi-agent-core`).
 > **Verdict synthétique** : migration **faible risque**, **saut direct recommandé**, **aucun changement de code prérequis** identifié dans les sources primaires. Les risques résiduels se concentrent sur la réécriture des ranges peers (obligatoire), la dérive de types détectable uniquement par `tsc`, et le comportement runtime **invisible à nos tests** (mocks) — d'où un test de chargement manuel obligatoire.
 
@@ -231,4 +231,19 @@ Migration exécutée le 2026-09-29. Résultats : les quatre packages résolus à
 - `glob` reste présent dans le SBOM, mais côté dev uniquement (`c8 → test-exclude → glob@13`) — le retrait amont 0.84.3 concernait le glob *runtime* de Pi.
 - `ws` a résolu **8.22.0** (plage `^8.21.0` flottante à la re-résolution, plancher de sécurité respecté).
 - L'override `protobufjs` reste **actif** : `@google/genai@2.21.0` dépend toujours de `protobufjs` (résolu 7.6.6) — le scénario « override inerte » ne s'est pas produit.
-- Reste à exécuter : le test manuel de chargement §9.5 (seule vérification non automatisable — nos tests mockent `ExtensionAPI`).
+- Test manuel de chargement §9.5 **exécuté** le 2026-10-01 — détail en §11.1 (les six étapes passent ; seule la variante TUI n'est pas automatisable depuis un environnement sans terminal).
+
+### 11.1 Test manuel de chargement §9.5 (2026-10-01)
+
+Host Pi **0.87.1** installé en sandbox isolée (`/tmp/opencode/pi-sandbox`, `npm install @earendil-works/pi-coding-agent@0.87.1` ; `pi --version` → `0.87.1`), avec `HOME` et agent-dir isolés sous `/tmp/opencode` pour ne **pas** toucher l'installation globale 0.84.2. Extension testée : copie du working tree (`extensions/security.ts`), chargée via `pi --extension` (jiti). Les réponses modèle proviennent d'un **faux fournisseur OpenAI-compatible local** scripté (aucun appel réseau externe, aucun secret réel).
+
+| # | Étape §9.5 | Résultat |
+|---|---|---|
+| 1 | Host Pi 0.87.1 en sandbox | ✅ `pi --version` → `0.87.1` ; install npm OK (118 packages, 0 vulnérabilité) ; installation globale 0.84.2 intacte |
+| 2 | Chargement sans erreur jiti ; `defaults/` résolue depuis le package (R9) | ✅ factory chargée ; audit `session.loaded` : `cwd=/tmp/opencode/pi-test-project`, `protectedPatternsCount=54`, `commandRuleCategories=[safe,moderate,dangerous,external]` → config `defaults/` bien résolue via `import.meta.url` |
+| 3 | Présence des 6 commandes `/security*` (R6) | ✅ enregistrements observés contre l'`ExtensionAPI` réel : `security`, `security:skills`, `security:trust`, `security:allow`, `security:clean`, `security:verify` (sonde d'instrumentation qui wrappe l'API du host sans modifier la factory) |
+| 4 | Commande interdite → blocage + raison + audit | ✅ `bash` avec `rm -rf …` → audit `bash.dangerous.block`, `reason="confirmation requires interactive (tui) mode; current mode: print"` ; en JSON le tool result porte `isError:true`. Guard fail-closed conforme (R4) |
+| 5 | Prompt avec faux secret → `before_provider_request` (R4) | ✅ faux jeton AWS `AKIAIOSFODNN7EXAMPLE` **absent** du corps sortant (`grep -c` = 0), remplacé par `***REDACTED:aws-access-key***` ; audit `secret.redacted` |
+| 6 | Répéter en modes non-TUI (R5) | ✅ en `--print` (mode `print`) **et** `--mode json` (mode `json`) : guard et secret-scanner identiques, champ `mode` correct dans l'audit |
+
+Précisions : §9.5 mentionne « `--mode print` » ; dans Pi 0.87.1 le mode texte non interactif s'obtient par `--print`/`-p` (`--mode` accepte `text\|json\|rpc`). Les deux chemins non-TUI (`print`, `json`) ont donc été couverts. **R4/R5/R6/R9 : vérifiés par exécution.** Seul le mode **TUI** reste non testé — il exige un terminal interactif, absent de cet environnement ; il n'a pas été simulé.
