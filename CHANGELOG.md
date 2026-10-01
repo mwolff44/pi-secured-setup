@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-01
+
+### Changed
+- Migrated the Pi peer dependencies from `^0.83.0` to `^0.87.1` (`@earendil-works/pi-coding-agent`, `pi-ai`, `pi-tui`; `pi-agent-core` is transitive). No announced breaking change in the interval touches the extension's surface — the analysis and the proof are in `docs/pi-0.87.1-migration-analysis.md` (§5.2). The lockfile resolved all four packages to 0.87.1 with no code change, and the manual load test §9.5 was executed on a sandboxed Pi 0.87.1 host (§11.1): the 6 `/security*` commands register against the real `ExtensionAPI`, the guard blocks dangerous commands with an audit entry, the secret-scanner redacts on `before_provider_request`, and non-TUI modes (`print`, `json`) behave identically.
+- CI now runs on Node 22 instead of Node 20 — the Pi packages require `node >=22.19.0`.
+
+### Security
+- Fixed a high-severity vulnerability in `brace-expansion` (5.0.9 → 5.0.12, resolves 8.x: GHSA-q2hr-2g5m-vwhr, GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p — DoS via quadratic-time brace expansion and stack exhaustion via uncontrolled recursion), transitive through `@earendil-works/pi-coding-agent` → `minimatch`. Found via `npm audit`; semver-compatible bump, no override needed.
+- Dismissed 11 stale Dependabot alerts (#22–#32, all `undici` < 8.10.2) as `fix_started` after re-verifying that `origin/main`'s lockfile already resolved undici 8.11.2 (the alerts were raised a day after the fix landed). `npm audit` now reports 0 vulnerabilities across all dependencies.
+
 ## [1.1.3] - 2026-09-29
 
 ### Security
