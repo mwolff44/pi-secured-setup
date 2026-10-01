@@ -3,10 +3,12 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import {
 	expandTilde,
 	resolvePath,
 	isInsideDir,
+	isInsideDirWith,
 	sha256,
 	generateSessionId,
 } from "../lib/utils.js";
@@ -69,6 +71,46 @@ describe("isInsideDir", () => {
 
 	it("completely different path is false", () => {
 		assert.equal(isInsideDir("/home/user/project", "/tmp/foo"), false);
+	});
+
+	it("sibling with shared prefix is false", () => {
+		assert.equal(isInsideDir("/home/user/project", "/home/user/project-b/file.ts"), false);
+	});
+});
+
+describe("isInsideDirWith — Windows paths", () => {
+	const win = path.win32;
+
+	it("file inside parent is true", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:\\Users\\me\\proj\\src\\a.ts"), true);
+	});
+
+	it("exact match is true", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:\\Users\\me\\proj"), true);
+	});
+
+	it("drive letter and folder case are ignored", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "c:\\users\\ME\\Proj\\a.ts"), true);
+	});
+
+	it("forward slashes are accepted", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:/Users/me/proj/a.ts"), true);
+	});
+
+	it("sibling with shared prefix is false", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:\\Users\\me\\proj-b\\a.ts"), false);
+	});
+
+	it("parent directory is false", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:\\Users\\me"), false);
+	});
+
+	it("other drive is false", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "D:\\proj\\a.ts"), false);
+	});
+
+	it("traversal out of the parent is false", () => {
+		assert.equal(isInsideDirWith(win, "C:\\Users\\me\\proj", "C:\\Users\\me\\proj\\..\\other\\a.ts"), false);
 	});
 });
 
