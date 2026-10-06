@@ -15,6 +15,15 @@ pi install git:github.com/mwolff44/pi-secured-setup@v1.0.0
 pi update pi-secured-setup
 ```
 
+### Platform support
+
+Linux is the reference platform and the only one covered by CI. macOS is expected to work but is not tested in CI.
+
+Windows support is **unofficial / best effort**. Path handling has been adapted
+for Windows (boundary check, basename protected-path patterns such as `.env` or
+`*.key`), but it is not tested in CI and path-based patterns (e.g. `.ssh/*`) are
+not covered there yet. Reports and fixes from Windows users are welcome.
+
 ## What It Does
 
 ### Guards (block before execution)
