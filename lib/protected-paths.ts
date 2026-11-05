@@ -100,7 +100,8 @@ export function evaluateProtectedPaths(
 				break;
 			}
 			// Also try matching against the basename.
-			const basename = candidate.split("/").pop() ?? "";
+			// Split on both separators so basename patterns also match Windows paths.
+			const basename = candidate.split(/[\\/]/).pop() ?? "";
 			if (matchGlob(pattern, basename)) {
 				matched = true;
 				break;
