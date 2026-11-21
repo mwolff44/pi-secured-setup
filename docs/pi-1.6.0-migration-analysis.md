@@ -1,7 +1,7 @@
 # Analyse d'impact — migration Pi 0.87.1 → 1.6.0
 
 > **Statut** : analyse **exécutée**. Rédigée et vérifiée le 2026-11-21 ; la migration a été réalisée le même jour — voir §11 « Retour d'exécution ». Les modifications ont porté sur `package.json` (peers `^0.87.1` → `^1.6.0`, suppression de l'override `undici`), `package-lock.json`, la CI (commentaire du job audit) et la documentation présente.
-> **Date** : 2026-11-21. **Cible** : `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` `^0.87.1` → `^1.6.0` (transitifs : `pi-agent-core`, plus les nouveaux `pi-mcp`, `pi-codemode`, `pi-schema`, `pi-telemetry` pinnes `1.6.0`).
+> **Date** : 2026-11-21. **Cible** : `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` `^0.87.1` → `^1.6.0` (transitifs : `pi-agent-core`, plus les nouveaux `pi-mcp`, `pi-codemode`, `pi-schema`, `pi-telemetry` épinglés à `1.6.0` exact).
 > **Verdict synthétique** : saut majeur 0.x → 1.x **faible risque** pour notre contrat, **aucun changement de code prérequis** (confirmé : `tsc --noEmit` 0 erreur et test de chargement sans retouche). La seule décision non triviale est l'override `undici` : **supprimé** — upstream pinne désormais `8.12.4` exact (patché des six GHSAs de la 1.6.0), garder notre plancher `^8.10.2` ferait flotter vers 8.13.x, jamais testé en amont.
 
 ---
@@ -168,7 +168,7 @@ Host pi 1.6.0 en sandbox (répertoire jetable, `HOME` isolé), extension chargé
 1. chargement sans erreur au démarrage ;
 2. les 6 commandes `/security*` s'enregistrent et répondent ;
 3. un bash dangereux est bloqué par le guard et produit une entrée d'audit ;
-4. un secret est redacté sur `before_provider_request` ;
+4. un secret est caviardé sur `before_provider_request` ;
 5. fail-closed en `--mode print` et `--mode json` (confirmations refusées hors TUI) ;
 6. `/security:verify` rejoue la chaîne HMAC sans erreur.
 
@@ -198,7 +198,7 @@ Host Pi **1.6.0** installé en sandbox isolé (`/tmp/opencode/pi16-sandbox`, `np
 | 1 | Chargement sans erreur ; `defaults/` résolue depuis le package | ✅ factory chargée par jiti ; audit `session.loaded` : `cwd=/tmp/opencode/pi16-project`, `protectedPatternsCount=54`, `commandRuleCategories=[safe,moderate,dangerous,external]` — config `defaults/` bien résolue via `import.meta.url` |
 | 2 | Les 6 commandes s'enregistrent et répondent | ✅ `get_commands` (RPC) liste les 6 contre l'`ExtensionAPI` réel : `security`, `security:skills`, `security:trust`, `security:allow`, `security:clean`, `security:verify` ; `/security` répond (notify « 🔒 Security Dashboard ») et `/security:verify` répond (notify « 🔍 Audit chain verification ») |
 | 3 | Bash dangereux → blocage + audit | ✅ tool call `bash` `rm -rf /tmp/pi16-project/data` → **bloqué** : tool result `isError:true`, raison « confirmation requires interactive (tui) mode » ; audit `bash.dangerous.block`, `category=dangerous` |
-| 4 | Secret redacté sur `before_provider_request` | ✅ faux jeton AWS `AKIAIOSFODNN7EXAMPLE` **absent du corps reçu par le fournisseur** (`grep` = 0), remplacé par `***REDACTED:aws-access-key***` ; audit `secret.redacted`, `patternName=aws-access-key` |
+| 4 | Secret caviardé sur `before_provider_request` | ✅ faux jeton AWS `AKIAIOSFODNN7EXAMPLE` **absent du corps reçu par le fournisseur** (`grep` = 0), remplacé par `***REDACTED:aws-access-key***` ; audit `secret.redacted`, `patternName=aws-access-key` |
 | 5 | Fail-closed `--mode print` et `--mode json` | ✅ print : blocage, audit « current mode: **print** », sortie texte propre, exit 0 ; json : tool result `isError:true` « current mode: **json** » dans le flux d'events |
 | 6 | `/security:verify` rejoue la chaîne HMAC | ✅ « ✅ All files verified — chain intact. / … 13 entries, chain intact » — vérification **cross-session** (chaîne accumulée sur les sessions rpc + print + json) |
 
