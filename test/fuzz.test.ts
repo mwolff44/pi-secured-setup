@@ -396,7 +396,18 @@ function buildOneMiBSecretPayload(): string {
 }
 
 describe("perf budget: 1 MiB payload scans within the CI budget (ADR-0013)", () => {
-	it("redactString completes a 1 MiB representative payload in < 150 ms", () => {
+	// Budget calibration (2026-11-21): the original 150 ms pin was ×1.5
+	// over the ~95 ms/MiB reference measured on dev hardware, but GitHub
+	// runners measure 157–178 ms for the SAME workload on the SAME commit
+	// (three CI observations: ~95 ms/run on a fast runner, 178 ms, 157 ms)
+	// — the pin sat mid-noise-band and flaked ~50% of runs. 300 ms is ×1.5
+	// over the worst observed runner measurement and still ~3× below the
+	// complexity-regression signal this pin exists to catch (the fixed
+	// O(K×line) redaction bug measured ~1 s on a 138 KB line, far worse at
+	// 1 MiB scale). Per-run assertion semantics are unchanged (#24).
+	const CI_BUDGET_MS = 300;
+
+	it(`redactString completes a 1 MiB representative payload in < ${CI_BUDGET_MS} ms`, () => {
 		const payload = buildOneMiBSecretPayload();
 		// Warm-up call: JIT-compile the regex set once so the measured
 		// runs reflect steady-state per-turn cost, not first-call
@@ -412,14 +423,14 @@ describe("perf budget: 1 MiB payload scans within the CI budget (ADR-0013)", () 
 			redactions = redactString(payload).redactions.length;
 			const elapsed = Date.now() - start;
 			assert.ok(
-				elapsed < 150,
-				`secret scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the 150 ms CI budget (ADR-0013)`,
+				elapsed < CI_BUDGET_MS,
+				`secret scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the ${CI_BUDGET_MS} ms CI budget (ADR-0013)`,
 			);
 		}
 		assert.ok(redactions > 0, "payload must actually contain redactable secrets");
 	});
 
-	it("detectInjection completes a 1 MiB representative payload in < 150 ms", () => {
+	it(`detectInjection completes a 1 MiB representative payload in < ${CI_BUDGET_MS} ms`, () => {
 		const payload = buildOneMiBSecretPayload();
 		detectInjection(payload.slice(0, 64 * 1024)); // warm-up
 		for (let run = 0; run < 2; run++) {
@@ -427,8 +438,8 @@ describe("perf budget: 1 MiB payload scans within the CI budget (ADR-0013)", () 
 			detectInjection(payload);
 			const elapsed = Date.now() - start;
 			assert.ok(
-				elapsed < 150,
-				`injection scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the 150 ms CI budget (ADR-0013)`,
+				elapsed < CI_BUDGET_MS,
+				`injection scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the ${CI_BUDGET_MS} ms CI budget (ADR-0013)`,
 			);
 		}
 	});
