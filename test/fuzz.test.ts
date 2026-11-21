@@ -399,38 +399,37 @@ describe("perf budget: 1 MiB payload scans within the CI budget (ADR-0013)", () 
 	it("redactString completes a 1 MiB representative payload in < 150 ms", () => {
 		const payload = buildOneMiBSecretPayload();
 		// Warm-up call: JIT-compile the regex set once so the measured
-		// calls reflect steady-state per-turn cost, not first-call
+		// runs reflect steady-state per-turn cost, not first-call
 		// compilation noise.
 		redactString(payload.slice(0, 64 * 1024));
-		// Two measured runs, assert the faster one: the budget pins the
-		// scanner's steady-state cost, not a single sample's GC/runner
-		// noise. A code regression that doubles the cost fails both runs.
-		let best = Number.POSITIVE_INFINITY;
+		// Two measured runs, each asserted against the budget: the pin
+		// is per-scan, consistent with the per-call convention of the
+		// fuzz suites above — a run over budget is a failure, never
+		// averaged away by picking the faster sample.
 		let redactions = 0;
 		for (let run = 0; run < 2; run++) {
 			const start = Date.now();
 			redactions = redactString(payload).redactions.length;
-			best = Math.min(best, Date.now() - start);
+			const elapsed = Date.now() - start;
+			assert.ok(
+				elapsed < 150,
+				`secret scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the 150 ms CI budget (ADR-0013)`,
+			);
 		}
 		assert.ok(redactions > 0, "payload must actually contain redactable secrets");
-		assert.ok(
-			best < 150,
-			`secret scan of a 1 MiB payload took ${best}ms — over the 150 ms CI budget (ADR-0013)`,
-		);
 	});
 
 	it("detectInjection completes a 1 MiB representative payload in < 150 ms", () => {
 		const payload = buildOneMiBSecretPayload();
 		detectInjection(payload.slice(0, 64 * 1024)); // warm-up
-		let best = Number.POSITIVE_INFINITY;
 		for (let run = 0; run < 2; run++) {
 			const start = Date.now();
 			detectInjection(payload);
-			best = Math.min(best, Date.now() - start);
+			const elapsed = Date.now() - start;
+			assert.ok(
+				elapsed < 150,
+				`injection scan of a 1 MiB payload took ${elapsed}ms (run ${run + 1}/2) — over the 150 ms CI budget (ADR-0013)`,
+			);
 		}
-		assert.ok(
-			best < 150,
-			`injection scan of a 1 MiB payload took ${best}ms — over the 150 ms CI budget (ADR-0013)`,
-		);
 	});
 });

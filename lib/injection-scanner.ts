@@ -102,7 +102,7 @@ const PROBE_INPUTS: readonly string[] = [
  */
 const _probeVerdicts = new Map<string, boolean>();
 
-/** Patterns already named in a rejection warning (warn once per session). */
+/** Patterns already named in a rejection warning, keyed by rule name + pattern. */
 const _warnedPatterns = new Set<string>();
 
 /**
@@ -120,31 +120,40 @@ function exceedsProbeBudget(pattern: RegExp): boolean {
 
 /**
  * Load-time safety gate for one rule: reject patterns whose probes blow
- * the budget, warning once per pattern string with the rule's name.
- * Verdicts are memoized by raw pattern string.
+ * the budget, warning once per rule name + pattern string with the
+ * rule's name. The (expensive) probe verdict is memoized by raw pattern
+ * string alone — renaming a rule never re-pays the probe cost — but the
+ * warning check runs on EVERY rejected verdict: a rejected regex
+ * reconfigured under a new rule name is a different configured rule and
+ * is reported under that name, as promised.
  */
 function passesLoadProbe(rule: InjectionRule, pattern: RegExp): boolean {
 	const cached = _probeVerdicts.get(rule.pattern);
-	if (cached !== undefined) return cached;
+	const rejected = cached !== undefined ? !cached : exceedsProbeBudget(pattern);
+	if (cached === undefined) {
+		_probeVerdicts.set(rule.pattern, !rejected);
+	}
 
-	const rejected = exceedsProbeBudget(pattern);
-	_probeVerdicts.set(rule.pattern, !rejected);
-
-	if (rejected && !_warnedPatterns.has(rule.pattern)) {
-		_warnedPatterns.add(rule.pattern);
-		console.error(
-			`[pi-secured-setup] WARNING: Injection rule "${rule.name}" was rejected at load: its regex exceeded the ${PATTERN_PROBE_BUDGET_MS} ms probe budget (likely catastrophic backtracking / ReDoS) and will NOT be used for detection. Fix or remove the pattern in ~/.pi/agent/security/injection-rules.json. The probe is a net, not a guarantee — review the rule manually.`,
-		);
+	if (rejected) {
+		const warnedKey = `${rule.name}\u0000${rule.pattern}`;
+		if (!_warnedPatterns.has(warnedKey)) {
+			_warnedPatterns.add(warnedKey);
+			console.error(
+				`[pi-secured-setup] WARNING: Injection rule "${rule.name}" was rejected at load: its regex exceeded the ${PATTERN_PROBE_BUDGET_MS} ms probe budget (likely catastrophic backtracking / ReDoS) and will NOT be used for detection. Fix or remove the pattern in ~/.pi/agent/security/injection-rules.json. The probe is a net, not a guarantee — review the rule manually.`,
+			);
+		}
 	}
 	return !rejected;
 }
 
 /**
- * Reset the probe memo + warning ledger (test-only hook).
+ * Reset the probe memo + warning ledger and the empty-compile warning
+ * state (test-only hook).
  */
 export function _resetProbeCacheForTest(): void {
 	_probeVerdicts.clear();
 	_warnedPatterns.clear();
+	_warnedEmptyCompile = false;
 }
 
 // ── Pattern compilation ───────────────────────────────────────────────
@@ -193,6 +202,35 @@ let _patterns: CompiledPattern[] = compileRules(FALLBACK_RULES);
 let _threshold: number = DEFAULT_THRESHOLD;
 
 /**
+ * Whether the last compile attempt produced no usable pattern. Used to
+ * warn once per "disarmed config era" instead of on every request when
+ * a configuration compiles to nothing.
+ */
+let _warnedEmptyCompile = false;
+
+/**
+ * Apply a compiled pattern set as the active patterns. FAIL CLOSED: a
+ * compile that produced zero usable patterns (every rule invalid or
+ * rejected by the load probe) keeps the previously active patterns in
+ * place and warns once — a machine configuration containing only
+ * broken/ReDoS patterns must never silently disarm injection detection
+ * (the same intent as the documented `[]` guard below).
+ */
+function applyCompiledPatterns(compiled: CompiledPattern[]): void {
+	if (compiled.length > 0) {
+		_patterns = compiled;
+		_warnedEmptyCompile = false;
+		return;
+	}
+	if (!_warnedEmptyCompile) {
+		_warnedEmptyCompile = true;
+		console.error(
+			"[pi-secured-setup] WARNING: no usable injection patterns were compiled (all supplied rules are invalid or were rejected at load) — keeping the previously active patterns. Fix the rules in ~/.pi/agent/security/injection-rules.json.",
+		);
+	}
+}
+
+/**
  * Load the default patterns from `defaults/injection-rules.json` at module
  * init so `detectInjection(text)` works standalone with the shipped
  * defaults. `registerInjectionScanner` later overrides this with the
@@ -203,7 +241,7 @@ function loadDefaultRules(): void {
 		const raw = readFileSync(resolve(DEFAULTS_DIR, "injection-rules.json"), "utf-8");
 		const parsed = JSON.parse(raw) as InjectionRulesFile;
 		if (parsed.patterns && parsed.patterns.length > 0) {
-			_patterns = compileRules(parsed.patterns);
+			applyCompiledPatterns(compileRules(parsed.patterns));
 		}
 		if (typeof parsed.threshold === "number" && parsed.threshold > 0) {
 			_threshold = parsed.threshold;
@@ -216,13 +254,16 @@ loadDefaultRules();
 
 /**
  * Replace the active injection patterns at runtime (called by the
- * registration with the machine-merged config). Invalid patterns are
- * skipped during compilation. Empty rule lists leave the existing patterns
- * in place so callers cannot accidentally disarm detection by passing `[]`.
+ * registration with the machine-merged config). Invalid or probe-rejected
+ * patterns are skipped during compilation. An EMPTY rule list leaves the
+ * existing patterns in place so callers cannot accidentally disarm
+ * detection by passing `[]` — and a compile that yields zero usable
+ * patterns (all rules invalid or rejected) keeps the previously active
+ * patterns too, warning once: detection never silently turns off.
  */
 export function setInjectionRules(rules: InjectionRule[], threshold: number): void {
 	if (Array.isArray(rules) && rules.length > 0) {
-		_patterns = compileRules(rules);
+		applyCompiledPatterns(compileRules(rules));
 	}
 	if (typeof threshold === "number" && threshold > 0) {
 		_threshold = threshold;
