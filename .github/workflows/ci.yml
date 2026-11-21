@@ -19,7 +19,7 @@
 #         fails the run.
 #       * HIGH is advisory: `npm audit --audit-level=high` runs with
 #         `continue-on-error: true`. Some transitive highs (e.g.
-#         protobufjs, undici) have no clean upstream fix and are
+#         protobufjs, ws) have no clean upstream fix and are
 #         mitigated via the `overrides` block in package.json; we
 #         surface them in the log without blocking PRs.
 
@@ -137,9 +137,12 @@ jobs:
     # Two-tier supply-chain gate:
     #   1. CRITICAL is a hard block — a critical vulnerability fails CI.
     #   2. HIGH is advisory — some transitive highs (e.g. protobufjs
-    #      DoS, undici) have no clean upstream fix and are pinned to
+    #      DoS, ws) have no clean upstream fix and are pinned to
     #      patched ranges via the `overrides` block in package.json, so
     #      we surface them in the run log without blocking PRs.
+    #      (`undici` used to be overridden as well; since the Pi 1.6.0
+    #      migration upstream pins undici 8.12.4 exactly, the override
+    #      was removed — see docs/pi-1.6.0-migration-analysis.md §1.)
     steps:
       - name: Checkout
         uses: actions/checkout@v7
