@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Scan bounds (ADR-0013): the secret scanner now enforces a total payload budget per `before_provider_request` — `scanBudgetBytes` (default 2 MiB, machine-only via `security-policy.json`). An over-budget payload skips the line-by-line scan and emits exactly one `secret.skipped` audit event plus one notification — never a silent skip — while PEM private-key redaction still runs (the budget must not bypass it). The injection scanner caps its scan window per line at `LINE_SCAN_CAP` (4096); truncated lines are counted per request and audited once per turn (`injection.truncated`), never one event per line. Payload text itself is never modified — only the scan window is capped.
+- Load-time ReDoS probe for operator injection patterns: each regex from `injection-rules.json` is tested against probe inputs (`"a".repeat(30)` and nested forms, graduated shortest-first with a ~50 ms budget); a pattern that blows the budget is rejected at load with a warning naming the rule, instead of freezing every turn (the canonical bomb `(a|a)*b` measured ~5.5 s per turn at 28 characters). Verdicts are memoized so the per-request pattern refresh stays free. The probe is a net, not a guarantee — documented as such.
+- Fuzz coverage for the scanners: the seeded 500 ms-budget harness now also runs `redactString` and `detectInjection` over ≥200 randomized/adversarial inputs each (long single lines, dense match runs, over-cap lines, PEM shapes), and a CI perf budget pins a 1 MiB representative payload scan at < 150 ms (×1.5 margin on the measured ~95 ms/MiB).
+
+### Fixed
+- `redactLineContent` rebuilt the line after every real match (`slice + concat` per match), making a line with K real matches cost O(K × line length): 6000 matches on a 138 KB line measured ~1 s — a per-turn DoS vector on attacker-controlled tool output, found by the new fuzz harness. Each pattern now runs in a single linear `String.replace` pass with identical redaction semantics (placeholder matches kept verbatim, real matches replaced, scanning continues after each replacement).
+
+### Changed
+- Documented the product boundary (ADR-0013): pi-secured-setup secures the agent's settings and behavior — not the code the agent generates; the rules channel on generated code lives in a separate extension. The README states the scope and documents the scan budgets and caps.
+
 ## [1.2.0] - 2026-10-01
 
 ### Changed

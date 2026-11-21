@@ -64,6 +64,14 @@ _Avoid_: Exfil blocker, data-leak filter
 Per-turn and per-session caps (tool calls per turn, confirmations per session) enforced by the guard pipeline. Exceeding a cap blocks the next call with a `ratelimit.block` audit event. Limits are loaded machine-only from `security-policy.json` — the project layer cannot raise or disable them.
 _Avoid_: Throttling, quota
 
+**Product boundary**:
+What this package secures: the agent's **settings and behavior** — boundary, protected paths, bash gate, secret redaction, injection marking, audit — and nothing else. The security of the **code the agent generates** is outside it and lives in a separate extension (ADR-0013).
+_Avoid_: Code-quality gate, full-stack security, code rules channel
+
+**Scan budget**:
+The total payload-string byte cap the secret scanner enforces per `before_provider_request` (`scanBudgetBytes`, machine-only from `security-policy.json`, default 2 MiB). An over-budget request skips the line-by-line scan and emits one `secret.skipped` audit event + notification — never a silent skip — while PEM private-key redaction still runs. Sibling bound: `LINE_SCAN_CAP` (4096) caps the injection scan window per line, with truncation audited once per turn.
+_Avoid_: Limit, quota, throttling
+
 ## Relationships
 
 - A **Guard** operates on tool calls *before* execution via a single combined `tool_call` handler. A **Scanner** operates on tool results or provider payloads *after* execution.
@@ -75,7 +83,8 @@ _Avoid_: Throttling, quota
 - Secret scanning is provider-agnostic: the Scanner recursively walks the provider payload for all string values and runs regex matching, ignoring message structure differences between Anthropic, OpenAI, Google, etc.
 - **Boundary** defines the geographic limit for Guards. **Protected paths** define the logical limit within that boundary.
 - **Command classification** determines how the bash Guard responds to a given command.
-- **Secret** scanning is performed by a Scanner that redacts values in the provider payload.
+- **Secret** scanning is performed by a Scanner that redacts values in the provider payload. The **Scan budget** bounds that scan per provider request; a budget hit is audited and notified, and PEM redaction is never bypassed.
+- The **Product boundary** keeps generated-code rules out of this package's config surface; machine-only layering (ADR-0006/0009) applies to everything inside the boundary.
 - **Skill approval** is managed by a Scanner that detects changes and prompts for decisions.
 - Every Guard and Scanner action produces an **Audit event**.
 - **Config layers** are merged to produce the runtime configuration for all Guards and Scanners. Pattern lists are additive; a `!` prefix on a pattern in a later layer excludes the matching inherited pattern.

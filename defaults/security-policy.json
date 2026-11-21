@@ -3,5 +3,6 @@
   "confirmationsPerSession": 200,
   "tokensPerTurnWarn": 32000,
   "toolCallsPerMinuteWarn": 60,
-  "tokensSessionWarn": 200000
+  "tokensSessionWarn": 200000,
+  "scanBudgetBytes": 2097152
 }

@@ -17,6 +17,12 @@
  * provider request (ADR-0006; CONTEXT.md — "a Scanner ... never prevent(s)
  * a tool from running"). The request always proceeds; only its payload text
  * may be annotated. Only the request is scanned — not the response.
+ *
+ * Scan bounds (ADR-0013): each line is scanned only up to
+ * `LINE_SCAN_CAP` (4096) characters — truncation is counted per request
+ * and audited once per turn. Operator-supplied patterns must pass a
+ * load-time ReDoS probe (a net, not a guarantee) before they are used;
+ * rejected patterns are dropped with a warning naming the rule.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -44,21 +50,126 @@ interface InjectionRulesFile {
 
 const DEFAULT_THRESHOLD = 3;
 
+/**
+ * Per-line scan cap (ADR-0013). Lines longer than this are scanned only
+ * up to the cap; the excess is not scanned (the scanner is heuristic, so
+ * coverage beyond 4096 chars per line is traded for a bounded worst
+ * case). Truncated lines are counted and audited once per turn — never
+ * one audit event per line.
+ */
+export const LINE_SCAN_CAP = 4096;
+
+// ── Load-time ReDoS probe ─────────────────────────────────────────────
+
+/**
+ * Per-pattern probe budget in milliseconds (ADR-0013). An operator
+ * pattern whose probes exceed this is rejected at load with a warning
+ * naming the rule.
+ */
+const PATTERN_PROBE_BUDGET_MS = 50;
+
+/**
+ * Probe inputs for the load-time ReDoS check. The `"a"` runs graduate
+ * from short to long: an exponentially-backtracking pattern trips the
+ * budget on a cheap short input before a longer one can freeze the load
+ * (a single `.test()` cannot be interrupted once started). The remaining
+ * shapes exercise nested / repeated structures. The probe is a net, not
+ * a guarantee — a pathological pattern that happens to run fast on
+ * these exact inputs still passes; the per-line cap
+ * ({@link LINE_SCAN_CAP}) bounds the damage it can cause per line.
+ */
+const PROBE_INPUTS: readonly string[] = [
+	"a".repeat(10),
+	"a".repeat(14),
+	"a".repeat(18),
+	"a".repeat(22),
+	"a".repeat(26),
+	"a".repeat(30),
+	"(".repeat(10) + "a".repeat(10) + ")".repeat(10),
+	"<|".repeat(10),
+	"[system] ".repeat(8),
+	("a".repeat(4) + "!").repeat(8),
+];
+
+/**
+ * Memoized probe verdicts keyed by raw pattern string (true = the
+ * pattern passed the probe). `compileRules` runs on every
+ * `before_provider_request` (patterns are refreshed from the merged
+ * config), so without memoization a healthy pattern would be re-probed
+ * on every request and a rejected one would re-pay its probe cost. The
+ * cache is bounded by the number of distinct pattern strings ever
+ * loaded (shipped defaults + operator config).
+ */
+const _probeVerdicts = new Map<string, boolean>();
+
+/** Patterns already named in a rejection warning (warn once per session). */
+const _warnedPatterns = new Set<string>();
+
+/**
+ * Run the probe inputs against a compiled pattern and report whether the
+ * per-pattern probe budget was exceeded.
+ */
+function exceedsProbeBudget(pattern: RegExp): boolean {
+	const start = Date.now();
+	for (const probe of PROBE_INPUTS) {
+		pattern.test(probe);
+		if (Date.now() - start > PATTERN_PROBE_BUDGET_MS) return true;
+	}
+	return false;
+}
+
+/**
+ * Load-time safety gate for one rule: reject patterns whose probes blow
+ * the budget, warning once per pattern string with the rule's name.
+ * Verdicts are memoized by raw pattern string.
+ */
+function passesLoadProbe(rule: InjectionRule, pattern: RegExp): boolean {
+	const cached = _probeVerdicts.get(rule.pattern);
+	if (cached !== undefined) return cached;
+
+	const rejected = exceedsProbeBudget(pattern);
+	_probeVerdicts.set(rule.pattern, !rejected);
+
+	if (rejected && !_warnedPatterns.has(rule.pattern)) {
+		_warnedPatterns.add(rule.pattern);
+		console.error(
+			`[pi-secured-setup] WARNING: Injection rule "${rule.name}" was rejected at load: its regex exceeded the ${PATTERN_PROBE_BUDGET_MS} ms probe budget (likely catastrophic backtracking / ReDoS) and will NOT be used for detection. Fix or remove the pattern in ~/.pi/agent/security/injection-rules.json. The probe is a net, not a guarantee — review the rule manually.`,
+		);
+	}
+	return !rejected;
+}
+
+/**
+ * Reset the probe memo + warning ledger (test-only hook).
+ */
+export function _resetProbeCacheForTest(): void {
+	_probeVerdicts.clear();
+	_warnedPatterns.clear();
+}
+
 // ── Pattern compilation ───────────────────────────────────────────────
 
 /**
  * Compile raw pattern strings into RegExp instances (case-insensitive).
  * Invalid patterns are skipped during compilation — parity with the
- * bash-gate's `classifySegment`, which silently drops unparseable regexes.
+ * bash-gate's `classifySegment`, which silently drops unparseable
+ * regexes. Each compiled pattern must additionally pass the load-time
+ * ReDoS probe (`passesLoadProbe`): operator-supplied patterns that are
+ * pathologically slow are rejected at load with a warning naming the
+ * rule, instead of freezing every turn (ADR-0013).
  */
 function compileRules(rules: InjectionRule[]): CompiledPattern[] {
 	const compiled: CompiledPattern[] = [];
 	for (const rule of rules) {
+		let pattern: RegExp;
 		try {
-			compiled.push({ name: rule.name, pattern: new RegExp(rule.pattern, "i") });
+			pattern = new RegExp(rule.pattern, "i");
 		} catch {
 			// Skip invalid regex patterns.
+			continue;
 		}
+		if (!passesLoadProbe(rule, pattern)) continue;
+		compiled.push({ name: rule.name, pattern });
 	}
 	return compiled;
 }
@@ -121,22 +232,52 @@ export function setInjectionRules(rules: InjectionRule[], threshold: number): vo
 // ── Detection ─────────────────────────────────────────────────────────
 
 /**
+ * Detection result including scan-coverage stats: `truncatedLines` counts
+ * the lines whose length exceeded {@link LINE_SCAN_CAP} and were scanned
+ * only up to the cap. `detectInjection` discards it; the payload walk
+ * aggregates it per request so the scanner can audit truncation once per
+ * turn instead of once per line.
+ */
+interface DetectionResult {
+	findings: InjectionFinding[];
+	truncatedLines: number;
+}
+
+/**
  * Detect prompt-injection indicators in a string. Processes the text
  * line-by-line, skipping comment lines (`#`, `//`, `/*`, `--`) for parity
- * with the secret scanner's `isCommentLine`. Returns one entry per
- * distinct pattern that matched at least once (deduplicated by name).
+ * with the secret scanner's `isCommentLine`. Lines longer than
+ * {@link LINE_SCAN_CAP} are truncated to the cap before matching — the
+ * payload content itself is never modified, only the scan window — and
+ * counted in `truncatedLines`. Returns one entry per distinct pattern
+ * that matched at least once (deduplicated by name).
  */
-export function detectInjection(text: string): InjectionFinding[] {
+function detectInjectionDetailed(text: string): DetectionResult {
 	const found = new Set<string>();
-	for (const line of text.split("\n")) {
-		if (isCommentLine(line)) continue;
+	let truncatedLines = 0;
+	for (const rawLine of text.split("\n")) {
+		if (isCommentLine(rawLine)) continue;
+		const line = rawLine.length > LINE_SCAN_CAP ? rawLine.slice(0, LINE_SCAN_CAP) : rawLine;
+		if (line !== rawLine) truncatedLines++;
 		for (const { name, pattern } of _patterns) {
 			if (pattern.test(line)) {
 				found.add(name);
 			}
 		}
 	}
-	return Array.from(found).map((patternName) => ({ patternName }));
+	return {
+		findings: Array.from(found).map((patternName) => ({ patternName })),
+		truncatedLines,
+	};
+}
+
+/**
+ * Detect prompt-injection indicators in a string (see
+ * `detectInjectionDetailed` for the full semantics). Public pure API:
+ * returns the findings only.
+ */
+export function detectInjection(text: string): InjectionFinding[] {
+	return detectInjectionDetailed(text).findings;
 }
 
 /**
@@ -152,21 +293,24 @@ export function markUntrusted(text: string): string {
 // ── Payload walk ──────────────────────────────────────────────────────
 
 /**
- * Scan + mark a single string, accumulating findings into `findings`.
- * Avoids running detection twice by computing it once and reusing the
- * result to decide whether to wrap.
+ * Scan + mark a single string, accumulating findings and truncation
+ * counts into `stats`. Avoids running detection twice by computing it
+ * once and reusing the result to decide whether to wrap.
  */
-function scanString(text: string, findings: InjectionFinding[]): string {
-	const detected = detectInjection(text);
-	if (detected.length === 0) return text;
-	findings.push(...detected);
+function scanString(text: string, findings: InjectionFinding[], stats: { truncatedLines: number }): string {
+	const detected = detectInjectionDetailed(text);
+	stats.truncatedLines += detected.truncatedLines;
+	if (detected.findings.length === 0) return text;
+	findings.push(...detected.findings);
 	return `[UNTRUSTED CONTENT]\n${text}\n[/UNTRUSTED CONTENT]`;
 }
 
 /**
  * Recursively walk a payload object, detecting and marking injection
  * payloads in all string values. Mutates the object in place and returns
- * it together with the aggregated findings. Depth is capped at 50.
+ * it together with the aggregated findings and the number of lines whose
+ * scan window was truncated ({@link LINE_SCAN_CAP} — aggregated per
+ * request, audited once per turn). Depth is capped at 50.
  * Does NOT parse provider message structure (ADR-0002) — this is the
  * symmetric counterpart of the secret scanner's `walkAndRedact`.
  *
@@ -187,10 +331,12 @@ function scanString(text: string, findings: InjectionFinding[]): string {
 export function walkAndMark(payload: unknown): {
 	findings: InjectionFinding[];
 	payload: unknown;
+	truncatedLines: number;
 } {
 	const findings: InjectionFinding[] = [];
-	const result = walkNode(payload, findings, 0);
-	return { findings, payload: result };
+	const stats = { truncatedLines: 0 };
+	const result = walkNode(payload, findings, stats, 0);
+	return { findings, payload: result, truncatedLines: stats.truncatedLines };
 }
 
 /**
@@ -219,18 +365,23 @@ function isTrustedSystemMessage(value: unknown): boolean {
 	return typeof role === "string" && TRUSTED_SYSTEM_ROLES.has(role);
 }
 
-function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): unknown {
+function walkNode(
+	obj: unknown,
+	findings: InjectionFinding[],
+	stats: { truncatedLines: number },
+	depth: number,
+): unknown {
 	if (depth > 50) return obj; // safety limit
 
 	if (typeof obj === "string") {
-		return scanString(obj, findings);
+		return scanString(obj, findings, stats);
 	}
 
 	if (Array.isArray(obj)) {
 		for (let i = 0; i < obj.length; i++) {
 			// Skip trusted system-prompt messages (role: system|developer).
 			if (isTrustedSystemMessage(obj[i])) continue;
-			obj[i] = walkNode(obj[i], findings, depth + 1);
+			obj[i] = walkNode(obj[i], findings, stats, depth + 1);
 		}
 		return obj;
 	}
@@ -241,7 +392,7 @@ function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): un
 			// Skip trusted system-prompt carrier fields (system,
 			// systemInstruction) and their subtrees entirely.
 			if (TRUSTED_SYSTEM_KEYS.has(key)) continue;
-			record[key] = walkNode(record[key], findings, depth + 1);
+			record[key] = walkNode(record[key], findings, stats, depth + 1);
 		}
 		return obj;
 	}
@@ -255,6 +406,13 @@ function walkNode(obj: unknown, findings: InjectionFinding[], depth: number): un
  * Turn-scoped injection count for the after_provider_response notification.
  */
 let _pendingInjectionCount = 0;
+
+/**
+ * Whether a line-truncation audit entry was already emitted this turn.
+ * Truncation is audited at most ONCE per turn — never one event per
+ * truncated line (ADR-0013 scan bounds).
+ */
+let _truncationAuditedThisTurn = false;
 
 /**
  * Register the injection scanner on the pi extension API.
@@ -277,7 +435,18 @@ export function registerInjectionScanner(
 		setInjectionRules(cfg.injection.patterns, cfg.injection.threshold);
 
 		const payload = event.payload as Record<string, unknown>;
-		const { findings } = walkAndMark(payload);
+		const { findings, truncatedLines } = walkAndMark(payload);
+
+		// Truncated lines (over LINE_SCAN_CAP): aggregate counter for this
+		// request, one audit entry per turn — scan coverage was reduced and
+		// the log must say so, without one event per line.
+		if (truncatedLines > 0 && !_truncationAuditedThisTurn) {
+			_truncationAuditedThisTurn = true;
+			auditLog("injection.truncated", "warning", {
+				lines: truncatedLines,
+				cap: LINE_SCAN_CAP,
+			});
+		}
 
 		if (findings.length === 0) {
 			// No findings — keep payload unchanged.
@@ -323,5 +492,6 @@ export function registerInjectionScanner(
 	// Reset counter at turn start to scope counts per turn.
 	pi.on("turn_start", () => {
 		_pendingInjectionCount = 0;
+		_truncationAuditedThisTurn = false;
 	});
 }
