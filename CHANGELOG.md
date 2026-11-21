@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-21
+
 ### Added
 - Scan bounds (ADR-0013): the secret scanner now enforces a total payload budget per `before_provider_request` — `scanBudgetBytes` (default 2 MiB, machine-only via `security-policy.json`). An over-budget payload skips the line-by-line scan and emits exactly one `secret.skipped` audit event plus one notification — never a silent skip — while PEM private-key redaction still runs (the budget must not bypass it). The injection scanner caps its scan window per line at `LINE_SCAN_CAP` (4096); truncated lines are counted per request and audited once per turn (`injection.truncated`), never one event per line. Payload text itself is never modified — only the scan window is capped.
 - Load-time ReDoS probe for operator injection patterns: each regex from `injection-rules.json` is tested against probe inputs (`"a".repeat(30)` and nested forms, graduated shortest-first with a ~50 ms budget); a pattern that blows the budget is rejected at load with a warning naming the rule, instead of freezing every turn (the canonical bomb `(a|a)*b` measured ~5.5 s per turn at 28 characters). Verdicts are memoized so the per-request pattern refresh stays free, and rejection warnings are keyed by rule name + pattern so a rejected regex renamed in the config is still reported under its new name. A configuration whose every pattern is invalid or rejected never disarms detection — the previously active patterns stay in force with a warning (fail closed). The probe is a net, not a guarantee — documented as such.
