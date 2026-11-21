@@ -7,6 +7,14 @@
  *
  * Only scans the request — not the response. Input-side redaction prevents
  * secrets from reaching the model, so they cannot appear in responses.
+ *
+ * Scan bounds (ADR-0013): the total string bytes of the payload are
+ * measured before scanning; above `scanBudgetBytes` (machine-only,
+ * `security-policy.json`, default 2 MiB) the line-by-line scan is
+ * SKIPPED with a `secret.skipped` audit entry + notification — never a
+ * silent skip. PEM private-key redaction still runs on over-budget
+ * payloads: it precedes line-splitting by design and the budget must
+ * not bypass it.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
@@ -155,6 +163,17 @@ function redactPEMBlocks(value: string): { result: string; redactions: Redaction
 /**
  * Scan and redact secrets from a single line (no comment check).
  * Used internally by redactString for per-line processing.
+ *
+ * Each pattern is applied in a single linear `String.replace` pass:
+ * the previous implementation rebuilt the line after every real match
+ * (`slice + concat`), which made a line with K real matches cost
+ * O(K × lineLength) — 6000 matches on a 138 KB line measured ~1 s, a
+ * per-turn DoS vector on attacker-controlled tool output (found by the
+ * fuzz harness). `replace` processes all matches in one pass and
+ * records redactions via the callback, preserving the exact semantics:
+ * placeholder matches are kept verbatim, real matches are replaced with
+ * `***REDACTED:{name}***`, and scanning continues after each
+ * replacement.
  */
 function redactLineContent(line: string): { result: string; redactions: Redaction[] } {
 	let result = line;
@@ -162,23 +181,11 @@ function redactLineContent(line: string): { result: string; redactions: Redactio
 
 	for (const { name, pattern } of SECRET_PATTERNS) {
 		const regex = new RegExp(pattern.source, pattern.flags);
-
-		let match: RegExpExecArray | null;
-		while ((match = regex.exec(result)) !== null) {
-			const matched = match[0];
-
-			if (isPlaceholder(matched)) continue;
-
-			const replacement = `***REDACTED:${name}***`;
+		result = result.replace(regex, (matched: string) => {
+			if (isPlaceholder(matched)) return matched;
 			redactions.push({ patternName: name, original: matched });
-
-			result =
-				result.slice(0, match.index) +
-				replacement +
-				result.slice(match.index + matched.length);
-
-			regex.lastIndex = match.index + replacement.length;
-		}
+			return `***REDACTED:${name}***`;
+		});
 	}
 
 	return { result, redactions };
@@ -294,6 +301,96 @@ export function walkAndRedact(
 	return obj;
 }
 
+// ── Scan budget ───────────────────────────────────────────────────────
+
+/**
+ * Shipped default total scan budget per provider request: 2 MiB of
+ * payload string content. The secret scan is linear at roughly 95 ms
+ * per MiB and re-scans the whole transcript every turn, so unbounded
+ * payloads translate directly into unbounded per-turn latency. The
+ * budget is machine-only via `security-policy.json` (`scanBudgetBytes`,
+ * resolved through `loadSecurityPolicy` — the project layer is ignored
+ * wholesale, ADR-0009). Mirrored into `DEFAULT_SECURITY_POLICY` in
+ * config.ts and `defaults/security-policy.json` — keep the three in
+ * sync. A missing, zero, or negative value falls back to this default
+ * (the budget cannot be silently disabled).
+ */
+export const DEFAULT_SCAN_BUDGET_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Resolve the active scan budget from the runtime config. Follows the
+ * `resolveMetricsThresholds` convention: only a positive number in
+ * `config.securityPolicy.scanBudgetBytes` overrides the default.
+ */
+export function resolveScanBudget(config: Config): number {
+	const value = config.securityPolicy?.scanBudgetBytes;
+	return typeof value === "number" && value > 0 ? value : DEFAULT_SCAN_BUDGET_BYTES;
+}
+
+/**
+ * Recursively sum the UTF-8 byte length of every string value in a
+ * payload (depth-capped at 50, parity with the redaction walks). This
+ * measurement pass is linear with a small constant — cheap next to the
+ * ~95 ms/MiB scan it is gating.
+ */
+export function sumStringBytes(obj: unknown, depth = 0): number {
+	if (depth > 50) return 0;
+	if (typeof obj === "string") return Buffer.byteLength(obj, "utf8");
+	if (Array.isArray(obj)) {
+		let sum = 0;
+		for (const item of obj) sum += sumStringBytes(item, depth + 1);
+		return sum;
+	}
+	if (obj !== null && typeof obj === "object") {
+		const record = obj as Record<string, unknown>;
+		let sum = 0;
+		for (const key of Object.keys(record)) {
+			sum += sumStringBytes(record[key], depth + 1);
+		}
+		return sum;
+	}
+	return 0;
+}
+
+/**
+ * Recursively walk a payload object redacting ONLY multi-line PEM
+ * private-key blocks in string values (depth-capped at 50). Used on
+ * over-budget payloads: PEM redaction is a single linear pass and
+ * private keys are the highest-value secret class, so the budget skips
+ * the line-by-line scan but must not bypass PEM redaction
+ * (`redactPEMBlocks` runs before line-splitting by design).
+ */
+export function walkAndRedactPEMOnly(
+	obj: unknown,
+	redactions: Redaction[],
+	depth = 0,
+): unknown {
+	if (depth > 50) return obj; // safety limit
+
+	if (typeof obj === "string") {
+		const { result, redactions: found } = redactPEMBlocks(obj);
+		redactions.push(...found);
+		return result;
+	}
+
+	if (Array.isArray(obj)) {
+		for (let i = 0; i < obj.length; i++) {
+			obj[i] = walkAndRedactPEMOnly(obj[i], redactions, depth + 1);
+		}
+		return obj;
+	}
+
+	if (obj !== null && typeof obj === "object") {
+		const record = obj as Record<string, unknown>;
+		for (const key of Object.keys(record)) {
+			record[key] = walkAndRedactPEMOnly(record[key], redactions, depth + 1);
+		}
+		return obj;
+	}
+
+	return obj;
+}
+
 // ── Scanner registration ──────────────────────────────────────────────
 
 /**
@@ -302,18 +399,56 @@ export function walkAndRedact(
 let _pendingRedactionCount = 0;
 
 /**
+ * Turn-scoped count of provider requests whose payload exceeded the scan
+ * budget (for the after_provider_response notification — one per turn).
+ */
+let _pendingSkipCount = 0;
+
+/**
  * Register the secret scanner on the pi extension API.
  *
  * Uses `before_provider_request` to scan and redact secrets (ADR-0002).
  * Uses `after_provider_response` to notify the user.
+ *
+ * Scan budget (ADR-0013): payloads whose total string content exceeds
+ * `scanBudgetBytes` skip the line-by-line scan, emit ONE `secret.skipped`
+ * audit entry + notification, and still run PEM private-key redaction —
+ * the budget never bypasses PEM redaction and never skips silently.
  */
 export function registerSecretScanner(
 	pi: ExtensionAPI,
-	_getConfig: () => Config,
+	getConfig: () => Config,
 ): void {
 	pi.on("before_provider_request", (event, _ctx) => {
 		const redactions: Redaction[] = [];
 		const payload = event.payload as Record<string, unknown>;
+
+		// Budget gate: measure first (cheap linear pass), then decide.
+		const budget = resolveScanBudget(getConfig());
+		const bytes = sumStringBytes(payload);
+		if (bytes > budget) {
+			// Over budget — skip the line-by-line scan, but NEVER bypass
+			// PEM redaction: it runs before line-splitting by design and
+			// stays in front of the budget.
+			walkAndRedactPEMOnly(payload, redactions);
+			for (const r of redactions) {
+				auditLog("secret.redacted", "warning", {
+					patternName: r.patternName,
+					originalLength: r.original.length,
+				});
+			}
+			_pendingRedactionCount += redactions.length;
+			_pendingSkipCount += 1;
+
+			// Exactly one skip event per over-budget request — never a
+			// silent skip.
+			auditLog("secret.skipped", "warning", {
+				bytes,
+				budget,
+			});
+
+			return redactions.length > 0 ? payload : undefined;
+		}
 
 		// Walk and redact in place
 		walkAndRedact(payload, redactions);
@@ -338,6 +473,17 @@ export function registerSecretScanner(
 	});
 
 	pi.on("after_provider_response", (_event, ctx) => {
+		if (_pendingSkipCount > 0) {
+			const skipped = _pendingSkipCount;
+			_pendingSkipCount = 0;
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`⚠️ secret scan skipped on ${skipped} request(s) this turn — payload exceeded scanBudgetBytes; PEM private keys were still redacted`,
+					"warning",
+				);
+			}
+		}
 		if (_pendingRedactionCount > 0) {
 			const count = _pendingRedactionCount;
 			_pendingRedactionCount = 0;
@@ -351,8 +497,9 @@ export function registerSecretScanner(
 		}
 	});
 
-	// Reset counter at turn start to scope redaction counts per turn
+	// Reset counters at turn start to scope counts per turn
 	pi.on("turn_start", () => {
 		_pendingRedactionCount = 0;
+		_pendingSkipCount = 0;
 	});
 }

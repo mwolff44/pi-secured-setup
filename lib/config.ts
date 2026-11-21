@@ -85,7 +85,8 @@ export type SecurityPolicy = SecurityLimits;
  * forensic entries would let an attacker suppress evidence by flooding
  * the log. The three trailing anomaly thresholds are consumed by the
  * metrics scanner (P2-5); they are populated here so callers reading
- * `config.securityPolicy` always see them.
+ * `config.securityPolicy` always see them. `scanBudgetBytes` is the
+ * total secret-scan budget consumed by the secret scanner (ADR-0013).
  */
 export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
 	toolCallsPerTurn: 100,
@@ -93,6 +94,14 @@ export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
 	tokensPerTurnWarn: 32000,
 	toolCallsPerMinuteWarn: 60,
 	tokensSessionWarn: 200000,
+	/**
+	 * Total secret-scan budget per provider request (ADR-0013). Mirrors
+	 * `DEFAULT_SCAN_BUDGET_BYTES` in secret-scanner.ts (the value is
+	 * duplicated, not imported, to keep config.ts free of inbound lib
+	 * dependencies — same pattern as the metrics thresholds). Keep
+	 * defaults/security-policy.json in sync as the third copy.
+	 */
+	scanBudgetBytes: 2 * 1024 * 1024,
 };
 
 export interface Config {

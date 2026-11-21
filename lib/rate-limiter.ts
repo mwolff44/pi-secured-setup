@@ -34,6 +34,10 @@
  * from `loadConfig` always populates them via `DEFAULT_SECURITY_POLICY`.
  * Consumers must fall back to the shipped defaults when the fields are
  * absent (see `resolveMetricsThresholds` in `metrics-scanner.ts`).
+ *
+ * `scanBudgetBytes` is the total secret-scan budget per provider
+ * request consumed by the secret scanner (ADR-0013); same
+ * optional-on-the-interface convention.
  */
 export interface SecurityLimits {
 	/** Max tool calls within a single turn (reset on turn_start). */
@@ -46,6 +50,13 @@ export interface SecurityLimits {
 	toolCallsPerMinuteWarn?: number;
 	/** Cumulative session token-count anomaly threshold (metrics scanner). */
 	tokensSessionWarn?: number;
+	/**
+	 * Total secret-scan budget in bytes per provider request (secret
+	 * scanner, ADR-0013). Over-budget payloads skip the line-by-line
+	 * scan with a `secret.skipped` audit event + notification; PEM
+	 * redaction still runs.
+	 */
+	scanBudgetBytes?: number;
 }
 
 export type RateLimitScope = "tool_calls" | "confirmations";

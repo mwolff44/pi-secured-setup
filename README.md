@@ -2,6 +2,8 @@
 
 A distributable pi-agent extension providing multi-layer security: **Guards** that block dangerous actions, **Scanners** that detect risks, and an **audit trail** that records everything.
 
+**Scope (ADR-0013):** this package secures the agent's **settings and behavior** — what it may do and what enters its context. It does not secure the **code the agent generates**; rules for generated code live in a separate extension.
+
 ## Installation
 
 ```bash
@@ -109,8 +111,8 @@ The **secret scanner** (ADR-0002) provides a second, independent layer: regardle
 | `command-rules.json` | all | Regex patterns for SAFE / MODERATE / DANGEROUS / EXTERNAL command classification |
 | `allowed-external.json` | all | Paths outside the project boundary that are allowed |
 | `audit-config.json` | machine | Log rotation settings (`maxFileSize`, `maxFiles`) |
-| `injection-rules.json` | machine | Prompt-injection heuristic patterns + per-turn `threshold` (a project-layer file is ignored — see ADR-0006) |
-| `security-policy.json` | machine | Rate limits (`toolCallsPerTurn`, `confirmationsPerSession`) + metrics anomaly thresholds (`tokensPerTurnWarn`, `toolCallsPerMinuteWarn`, `tokensSessionWarn`). A project-layer file is ignored — see ADR-0009. |
+| `injection-rules.json` | machine | Prompt-injection heuristic patterns + per-turn `threshold` (a project-layer file is ignored — see ADR-0006). Each pattern must pass a load-time ReDoS probe; a rejected pattern is dropped with a warning naming the rule (see [Scan budgets and caps](#scan-budgets-and-caps)). |
+| `security-policy.json` | machine | Rate limits (`toolCallsPerTurn`, `confirmationsPerSession`) + metrics anomaly thresholds (`tokensPerTurnWarn`, `toolCallsPerMinuteWarn`, `tokensSessionWarn`) + the secret-scan budget (`scanBudgetBytes`, default 2 MiB). A project-layer file is ignored — see ADR-0009. |
 | `skill-approvals.json` | machine | Auto-managed — skill hashes + approval decisions |
 
 ### Per-project example
@@ -165,6 +167,25 @@ The metrics scanner warns when token or tool-call counters cross a threshold —
 ```
 
 Set a field to `0` to disable that specific warning. The project layer cannot raise or disable these thresholds (ADR-0009) — a checked-in `.pi/security/security-policy.json` is ignored with a warning. Reload with `/reload` after editing.
+
+### Scan budgets and caps
+
+The scanners walk every string of the provider payload on every turn, so their cost is bounded explicitly (ADR-0013). Every bound that trades away coverage announces itself in the audit log — the one outcome this package refuses is a silent skip.
+
+| Bound | Applies to | Default | Behaviour when hit |
+|-------|-----------|---------|-------------------|
+| `LINE_SCAN_CAP` (4096) | Injection scanner, per line | fixed | Lines longer than the cap are scanned only up to the cap. The truncated-line count is audited once per turn as `injection.truncated` — never one event per line. Payload text itself is never modified. |
+| `scanBudgetBytes` | Secret scanner, per provider request | 2 MiB (`security-policy.json`, machine-only) | Over-budget payloads skip the line-by-line scan and emit exactly one `secret.skipped` audit entry + one notification. **PEM private-key redaction still runs** — the budget never bypasses it. |
+| Load-time probe (~50 ms) | Operator injection patterns, at load | fixed | A pattern from `injection-rules.json` whose probe inputs blow the budget is rejected at load with a warning naming the rule. The probe is a net, not a guarantee — review rejected rules manually. |
+
+```jsonc
+// ~/.pi/agent/security/security-policy.json
+{
+  "scanBudgetBytes": 2097152 // raise for very large transcripts; PEM redaction is unaffected
+}
+```
+
+The secret scan measures ~95 ms per MiB; the CI budget pins a 1 MiB representative payload at < 150 ms. A machine-layer `security-policy.json` copied from an older version lacks `scanBudgetBytes` — the shipped default applies until you add it (see the first-run-copy pattern in [Troubleshooting](#troubleshooting)).
 
 ### Injection scanner patterns
 
