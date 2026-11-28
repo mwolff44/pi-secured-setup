@@ -2,7 +2,7 @@
  * Shared utilities for the pi-secured-setup extension.
  */
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { resolve, normalize, dirname } from "node:path";
+import nodePath, { resolve, normalize, dirname } from "node:path";
 import { homedir } from "node:os";
 import { realpathSync, lstatSync } from "node:fs";
 
@@ -37,9 +37,26 @@ export function resolvePath(base: string, path: string): string {
  * Check whether `child` is inside `parent` (both absolute normalised paths).
  */
 export function isInsideDir(parent: string, child: string): boolean {
-	const rel = normalize(child);
-	const dir = normalize(parent);
-	return rel.startsWith(dir + "/") || rel === dir;
+	return isInsideDirWith(nodePath, parent, child);
+}
+
+/**
+ * `isInsideDir` against an explicit path implementation, so both POSIX and
+ * Windows semantics can be tested on any host. Windows paths use `\` and are
+ * compared case-insensitively.
+ */
+export function isInsideDirWith(
+	pathApi: Pick<typeof nodePath, "normalize" | "relative" | "isAbsolute" | "sep">,
+	parent: string,
+	child: string,
+): boolean {
+	const caseInsensitive = pathApi.sep === "\\";
+	const fold = (p: string) => (caseInsensitive ? pathApi.normalize(p).toLowerCase() : pathApi.normalize(p));
+	const dir = fold(parent);
+	const target = fold(child);
+	if (target === dir) return true;
+	const rel = pathApi.relative(dir, target);
+	return rel !== "" && rel !== ".." && !rel.startsWith(".." + pathApi.sep) && !pathApi.isAbsolute(rel);
 }
 
 // ── Symlink resolution ────────────────────────────────────────────────
